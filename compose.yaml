@@ -1,0 +1,13 @@
+services:
+  shopper-easly-bot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/shopperbot.sqlite3
+    volumes:
+      - shopperbot-data:/data
+    restart: unless-stopped
+
+volumes:
+  shopperbot-data:

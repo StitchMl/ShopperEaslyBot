@@ -1,0 +1,53 @@
+services:
+  - type: worker
+    name: shopper-easly-bot
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    dockerCommand: python -m shopper_merge_bot
+    maxShutdownDelaySeconds: 30
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+      - key: SOURCE_CHATS
+        value: ""
+      - key: DESTINATION_CHAT
+        value: ""
+      - key: DATABASE_PATH
+        value: /data/shopperbot.sqlite3
+      - key: COPY_MEDIA
+        value: "true"
+      - key: INCLUDE_SOURCE_LINK
+        value: "true"
+      - key: JOIN_SOURCES
+        value: "false"
+      - key: MONITOR_ALL_CHATS
+        value: "false"
+      - key: STARTUP_BACKFILL_LIMIT
+        value: "0"
+      - key: DEDUPE_TTL_DAYS
+        value: "14"
+      - key: MIN_POST_INTERVAL_SECONDS
+        value: "1"
+      - key: MAX_TEXT_CHARS
+        value: "3500"
+      - key: ALLOW_PATTERNS
+        value: ""
+      - key: SKIP_PATTERNS
+        value: ""
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DRY_RUN
+        value: "false"

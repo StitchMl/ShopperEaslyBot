@@ -1,0 +1,33 @@
+app = "shoppereaslybot"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATABASE_PATH = "/data/shopperbot.sqlite3"
+  COPY_MEDIA = "true"
+  INCLUDE_SOURCE_LINK = "true"
+  JOIN_SOURCES = "false"
+  MONITOR_ALL_CHATS = "false"
+  STARTUP_BACKFILL_LIMIT = "0"
+  DEDUPE_TTL_DAYS = "14"
+  MIN_POST_INTERVAL_SECONDS = "1"
+  MAX_TEXT_CHARS = "3500"
+  LOG_LEVEL = "INFO"
+  DRY_RUN = "false"
+
+[processes]
+  app = "python -m shopper_merge_bot"
+
+[mounts]
+  source = "shopperbot_data"
+  destination = "/data"
+
+[deploy]
+  strategy = "immediate"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
