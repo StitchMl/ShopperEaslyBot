@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -12,6 +13,19 @@ class SourceChat:
     title: str
     username: str
     added_at: int
+
+
+@dataclass(frozen=True)
+class OfferRecord:
+    fingerprint: str
+    destination_chat_id: str
+    primary_message_id: int
+    extra_message_ids: tuple[int, ...]
+    text: str
+    category: str
+    price: Decimal | None
+    source_count: int
+    status: str
 
 
 class DedupeStore:
@@ -59,6 +73,33 @@ class DedupeStore:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS offers (
+                fingerprint TEXT PRIMARY KEY,
+                destination_chat_id TEXT NOT NULL,
+                primary_message_id INTEGER NOT NULL,
+                extra_message_ids TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'altro',
+                price TEXT,
+                source_count INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS offer_sources (
+                fingerprint TEXT NOT NULL,
+                source_chat_id TEXT NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                source_title TEXT NOT NULL DEFAULT '',
+                source_link TEXT NOT NULL DEFAULT '',
+                added_at INTEGER NOT NULL,
+                PRIMARY KEY (fingerprint, source_chat_id, source_message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_offer_sources_message
+            ON offer_sources(source_chat_id, source_message_id);
             """
         )
 
@@ -136,6 +177,181 @@ class DedupeStore:
             (user_id,),
         ).fetchone()
         return row is not None
+
+    def get_offer(self, fingerprint: str) -> OfferRecord | None:
+        row = self._conn.execute(
+            """
+            SELECT
+                fingerprint,
+                destination_chat_id,
+                primary_message_id,
+                extra_message_ids,
+                text,
+                category,
+                price,
+                source_count,
+                status
+            FROM offers
+            WHERE fingerprint = ?
+            """,
+            (fingerprint,),
+        ).fetchone()
+        if row is None:
+            return None
+        extra_ids = tuple(
+            int(item) for item in str(row[3]).split(",") if item.strip().isdigit()
+        )
+        return OfferRecord(
+            fingerprint=str(row[0]),
+            destination_chat_id=str(row[1]),
+            primary_message_id=int(row[2]),
+            extra_message_ids=extra_ids,
+            text=str(row[4]),
+            category=str(row[5]),
+            price=Decimal(str(row[6])) if row[6] else None,
+            source_count=int(row[7]),
+            status=str(row[8]),
+        )
+
+    def save_offer(
+        self,
+        *,
+        fingerprint: str,
+        destination_chat_id: str,
+        primary_message_id: int,
+        extra_message_ids: tuple[int, ...],
+        text: str,
+        category: str,
+        price: Decimal | None,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO offers(
+                fingerprint,
+                destination_chat_id,
+                primary_message_id,
+                extra_message_ids,
+                text,
+                category,
+                price,
+                source_count,
+                status,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)
+            ON CONFLICT(fingerprint) DO UPDATE SET
+                text = excluded.text,
+                category = excluded.category,
+                price = excluded.price,
+                updated_at = excluded.updated_at
+            """,
+            (
+                fingerprint,
+                destination_chat_id,
+                primary_message_id,
+                ",".join(str(item) for item in extra_message_ids),
+                text,
+                category,
+                str(price) if price is not None else None,
+                int(time.time()),
+                int(time.time()),
+            ),
+        )
+
+    def update_offer_text(self, fingerprint: str, text: str, source_count: int) -> None:
+        self._conn.execute(
+            """
+            UPDATE offers
+            SET text = ?, source_count = ?, updated_at = ?
+            WHERE fingerprint = ?
+            """,
+            (text, source_count, int(time.time()), fingerprint),
+        )
+
+    def mark_offer_status(self, fingerprint: str, status: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE offers
+            SET status = ?, updated_at = ?
+            WHERE fingerprint = ?
+            """,
+            (status, int(time.time()), fingerprint),
+        )
+
+    def add_offer_source(
+        self,
+        *,
+        fingerprint: str,
+        source_chat_id: str,
+        source_message_id: int,
+        source_title: str,
+        source_link: str,
+    ) -> bool:
+        before = self._conn.total_changes
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO offer_sources(
+                fingerprint,
+                source_chat_id,
+                source_message_id,
+                source_title,
+                source_link,
+                added_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fingerprint,
+                source_chat_id,
+                source_message_id,
+                source_title,
+                source_link,
+                int(time.time()),
+            ),
+        )
+        return self._conn.total_changes > before
+
+    def offer_sources(self, fingerprint: str) -> list[tuple[str, str]]:
+        rows = self._conn.execute(
+            """
+            SELECT source_title, source_link
+            FROM offer_sources
+            WHERE fingerprint = ?
+            ORDER BY added_at
+            """,
+            (fingerprint,),
+        ).fetchall()
+        return [(str(title), str(link)) for title, link in rows]
+
+    def fingerprints_for_source_message(
+        self,
+        source_chat_id: str,
+        source_message_id: int,
+    ) -> list[str]:
+        rows = self._conn.execute(
+            """
+            SELECT fingerprint
+            FROM offer_sources
+            WHERE source_chat_id = ? AND source_message_id = ?
+            """,
+            (source_chat_id, source_message_id),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def get_filter_categories(self) -> tuple[str, ...]:
+        value = self.get_config("filter_categories") or ""
+        return tuple(item.strip().lower() for item in value.split(",") if item.strip())
+
+    def set_filter_categories(self, categories: tuple[str, ...]) -> None:
+        self.set_config("filter_categories", ",".join(categories))
+
+    def get_filter_price(self, key: str) -> Decimal | None:
+        value = self.get_config(key)
+        return Decimal(value) if value else None
+
+    def set_filter_price(self, key: str, value: Decimal | None) -> None:
+        self.set_config(key, str(value) if value is not None else "")
 
     def has_message(self, source_chat_id: str, message_id: int) -> bool:
         row = self._conn.execute(

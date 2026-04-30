@@ -18,9 +18,15 @@ from telethon.tl.types import Message
 
 from .chat_folder import import_chat_folder
 from .config import ConfigError, Settings, parse_chat_ref
-from .dedupe import DedupeStore
+from .dedupe import DedupeStore, OfferRecord
 from .formatter import build_outbound_text, trim_text
 from .normalization import build_fingerprint
+from .offer_analysis import (
+    CATEGORY_KEYWORDS,
+    analyze_offer,
+    parse_price_limit,
+    source_score,
+)
 
 
 LOGGER = logging.getLogger("shopper_merge_bot")
@@ -202,6 +208,66 @@ def matches_any(text: str, patterns: tuple[str, ...]) -> bool:
     return False
 
 
+def _message_ids_from_result(result: object) -> list[int]:
+    if isinstance(result, list):
+        return [int(item.id) for item in result if hasattr(item, "id")]
+    if hasattr(result, "id"):
+        return [int(result.id)]
+    return []
+
+
+def destination_peer_id(destination: object) -> str:
+    return str(utils.get_peer_id(destination))
+
+
+def build_offer_publish_text(
+    *,
+    source_title: str,
+    body: str,
+    source_link: str | None,
+    category: str,
+    price: object | None,
+    sources: list[tuple[str, str]],
+    max_chars: int,
+) -> str:
+    text = build_outbound_text(
+        source_title=source_title,
+        body=body,
+        source_link=source_link,
+        max_chars=max_chars,
+    )
+    metadata = [f"Categoria: {category}"]
+    if price is not None:
+        metadata.append(f"Prezzo rilevato: {price} EUR")
+    if len(sources) > 1:
+        seen_titles = []
+        for title, _link in sources:
+            if title and title not in seen_titles:
+                seen_titles.append(title)
+        if seen_titles:
+            metadata.append("Visto anche su: " + ", ".join(seen_titles[1:6]))
+    suffix = "\n\n" + "\n".join(metadata)
+    return trim_text(text + suffix, max_chars)
+
+
+def passes_filters(store: DedupeStore, category: str, price: object | None) -> bool:
+    categories = store.get_filter_categories()
+    if categories and category not in categories:
+        return False
+
+    min_price = store.get_filter_price("filter_min_price")
+    max_price = store.get_filter_price("filter_max_price")
+    if min_price is None and max_price is None:
+        return True
+    if price is None:
+        return False
+    if min_price is not None and price < min_price:
+        return False
+    if max_price is not None and price > max_price:
+        return False
+    return True
+
+
 async def send_with_retry(
     sender: TelegramClient,
     destination: object,
@@ -209,15 +275,15 @@ async def send_with_retry(
     text: str,
     copy_media: bool,
     limiter: RateLimiter,
-) -> None:
+) -> list[int]:
     await limiter.wait()
     try:
-        await send_once(sender, destination, message, text, copy_media)
+        return await send_once(sender, destination, message, text, copy_media)
     except FloodWaitError as exc:
         LOGGER.warning("Telegram flood wait: sleeping %s seconds", exc.seconds)
         await asyncio.sleep(exc.seconds + 1)
         await limiter.wait()
-        await send_once(sender, destination, message, text, copy_media)
+        return await send_once(sender, destination, message, text, copy_media)
 
 
 async def send_once(
@@ -226,28 +292,68 @@ async def send_once(
     message: Message,
     text: str,
     copy_media: bool,
-) -> None:
+) -> list[int]:
     if copy_media and message.media:
         with tempfile.TemporaryDirectory(prefix="shopperbot-") as temp_dir:
             downloaded = await message.download_media(file=temp_dir)
             if downloaded:
                 caption = trim_text(text, CAPTION_LIMIT)
-                await sender.send_file(
+                result = await sender.send_file(
                     destination,
                     file=Path(downloaded),
                     caption=caption,
                     parse_mode=None,
                 )
+                message_ids = _message_ids_from_result(result)
                 if len(text) > CAPTION_LIMIT:
-                    await sender.send_message(destination, text, parse_mode=None)
-                return
+                    extra = await sender.send_message(destination, text, parse_mode=None)
+                    message_ids.extend(_message_ids_from_result(extra))
+                return message_ids
 
-    await sender.send_message(
+    result = await sender.send_message(
         destination,
         text,
         link_preview=True,
         parse_mode=None,
     )
+    return _message_ids_from_result(result)
+
+
+async def edit_offer_message(
+    sender: TelegramClient,
+    destination: object,
+    offer: OfferRecord,
+    text: str,
+) -> None:
+    try:
+        await sender.edit_message(
+            destination,
+            offer.primary_message_id,
+            trim_text(text, 3500),
+            parse_mode=None,
+            link_preview=True,
+        )
+    except Exception:
+        LOGGER.exception("Could not edit merged offer %s", offer.fingerprint)
+
+
+async def delete_offer(
+    sender: TelegramClient,
+    destination: object | None,
+    store: DedupeStore,
+    fingerprint: str,
+    reason: str,
+) -> None:
+    offer = store.get_offer(fingerprint)
+    if offer is None or offer.status != "active":
+        return
+    if destination is not None:
+        ids = [offer.primary_message_id, *offer.extra_message_ids]
+        try:
+            await sender.delete_messages(destination, ids)
+        except Exception:
+            LOGGER.exception("Could not delete offer %s", fingerprint)
+    store.mark_offer_status(fingerprint, f"deleted:{reason}")
 
 
 async def handle_message(
@@ -259,6 +365,7 @@ async def handle_message(
     destination: object | None,
     limiter: RateLimiter,
     ignored_chat_ids: set[str],
+    allow_seen_update: bool = False,
 ) -> None:
     source_id = str(message.chat_id or utils.get_peer_id(message.peer_id))
     message_id = int(message.id)
@@ -270,12 +377,23 @@ async def handle_message(
     if destination is None:
         LOGGER.info("Skipping %s/%s because no destination is configured", source_id, message_id)
         return
-    if store.has_message(source_id, message_id):
-        return
 
     raw_text = message.raw_text or ""
     if not raw_text and not message.media:
         store.mark_message(source_id, message_id)
+        return
+
+    facts = analyze_offer(raw_text)
+    if facts.invalid:
+        for fingerprint in store.fingerprints_for_source_message(source_id, message_id):
+            await delete_offer(sender, destination, store, fingerprint, "invalid-source-edit")
+        store.mark_message(source_id, message_id)
+        return
+
+    if allow_seen_update and store.fingerprints_for_source_message(source_id, message_id):
+        return
+
+    if store.has_message(source_id, message_id) and not allow_seen_update:
         return
 
     searchable_text = raw_text or ""
@@ -286,26 +404,63 @@ async def handle_message(
         store.mark_message(source_id, message_id)
         return
 
-    fingerprint = build_fingerprint(raw_text, fallback=f"{source_id}:{message_id}")
-    ttl_seconds = settings.dedupe_ttl_days * 24 * 60 * 60
-    if not store.claim_fingerprint(fingerprint, source_id, message_id, ttl_seconds):
-        LOGGER.info("Duplicate skipped from %s/%s", source_id, message_id)
+    link = await source_permalink(message) if settings.include_source_link else None
+    title = await chat_title(message)
+    if not passes_filters(store, facts.category, facts.price):
+        LOGGER.info(
+            "Filtered message from %s/%s category=%s price=%s",
+            source_id,
+            message_id,
+            facts.category,
+            facts.price,
+        )
         store.mark_message(source_id, message_id)
         return
 
-    link = await source_permalink(message) if settings.include_source_link else None
-    outbound = build_outbound_text(
-        source_title=await chat_title(message),
+    fingerprint = build_fingerprint(raw_text, fallback=f"{source_id}:{message_id}")
+    existing = store.get_offer(fingerprint)
+    if existing and existing.status == "active":
+        added = store.add_offer_source(
+            fingerprint=fingerprint,
+            source_chat_id=source_id,
+            source_message_id=message_id,
+            source_title=title,
+            source_link=link or "",
+        )
+        store.mark_message(source_id, message_id)
+        if added:
+            sources = store.offer_sources(fingerprint)
+            merged = build_offer_publish_text(
+                source_title=sources[0][0] if sources else title,
+                body=existing.text,
+                source_link=sources[0][1] if sources else link,
+                category=existing.category,
+                price=existing.price,
+                sources=sources,
+                max_chars=settings.max_text_chars,
+            )
+            store.update_offer_text(fingerprint, existing.text, len(sources))
+            if not settings.dry_run:
+                await edit_offer_message(sender, destination, existing, merged)
+            LOGGER.info("Merged duplicate offer %s from %s/%s", fingerprint, source_id, message_id)
+        return
+
+    outbound = build_offer_publish_text(
+        source_title=title,
         body=raw_text,
         source_link=link,
+        category=facts.category,
+        price=facts.price,
+        sources=[(title, link or "")],
         max_chars=settings.max_text_chars,
     )
 
     try:
+        message_ids: list[int] = []
         if settings.dry_run:
             LOGGER.info("DRY_RUN message from %s/%s:\n%s", source_id, message_id, outbound)
         else:
-            await send_with_retry(
+            message_ids = await send_with_retry(
                 sender=sender,
                 destination=destination,
                 message=message,
@@ -313,10 +468,26 @@ async def handle_message(
                 copy_media=settings.copy_media,
                 limiter=limiter,
             )
+        if message_ids:
+            store.save_offer(
+                fingerprint=fingerprint,
+                destination_chat_id=destination_peer_id(destination),
+                primary_message_id=message_ids[0],
+                extra_message_ids=tuple(message_ids[1:]),
+                text=raw_text,
+                category=facts.category,
+                price=facts.price,
+            )
+            store.add_offer_source(
+                fingerprint=fingerprint,
+                source_chat_id=source_id,
+                source_message_id=message_id,
+                source_title=title,
+                source_link=link or "",
+            )
         store.mark_message(source_id, message_id)
         LOGGER.info("Delivered message from %s/%s", source_id, message_id)
     except Exception:
-        store.release_fingerprint(fingerprint)
         raise
 
 
@@ -370,12 +541,33 @@ def control_help(user_id: int | None) -> str:
         "/find <testo> - cerca canali, gruppi e bot visibili dal tuo account",
         "/destination <@canale o id> - imposta dove pubblicare le offerte",
         "/destination_here - pubblica nella chat corrente",
+        "/filters - mostra filtri categoria/prezzo",
+        "/category <nomi|clear|list> - filtra per categoria",
+        "/price <min|max|clear> [valore] - filtra per prezzo",
+        "/scan_bots [offerte|notizie] - aggiunge bot compatibili gia' visibili",
         "/sources - mostra le sorgenti attive",
         "/clear_sources - svuota le sorgenti",
         "/status - stato del servizio",
         "/whoami - mostra user id e chat id",
     ]
     return "\n".join(lines)
+
+
+def filters_text(store: DedupeStore) -> str:
+    categories = store.get_filter_categories()
+    min_price = store.get_filter_price("filter_min_price")
+    max_price = store.get_filter_price("filter_max_price")
+    return "\n".join(
+        [
+            "Filtri attivi",
+            f"Categorie: {', '.join(categories) if categories else 'tutte'}",
+            f"Prezzo minimo: {min_price if min_price is not None else 'nessuno'}",
+            f"Prezzo massimo: {max_price if max_price is not None else 'nessuno'}",
+            "",
+            "Categorie disponibili:",
+            ", ".join(sorted(CATEGORY_KEYWORDS.keys()) + ["altro"]),
+        ]
+    )
 
 
 async def is_control_admin(
@@ -543,6 +735,121 @@ async def register_control_bot(
             lines.append(f"- [{kind}] {title}{handle}\n  /add {dialog_id}")
         await event.respond("\n".join(lines), parse_mode=None)
 
+    @bot.on(events.NewMessage(pattern=r"^/filters(?:@\w+)?(?:\s|$)"))
+    async def on_filters(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+        await event.respond(filters_text(store), parse_mode=None)
+
+    @bot.on(events.NewMessage(pattern=r"^/category(?:@\w+)?(?:\s|$)"))
+    async def on_category(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+
+        arg = command_arg(event.raw_text or "").strip().lower()
+        available = set(CATEGORY_KEYWORDS.keys()) | {"altro"}
+        if not arg or arg == "list":
+            await event.respond(
+                "Categorie disponibili:\n" + ", ".join(sorted(available)),
+                parse_mode=None,
+            )
+            return
+        if arg == "clear":
+            store.set_filter_categories(())
+            await event.respond("Filtro categorie disattivato.", parse_mode=None)
+            return
+
+        categories = tuple(
+            item.strip().lower()
+            for item in re.split(r"[, ]+", arg)
+            if item.strip()
+        )
+        unknown = [item for item in categories if item not in available]
+        if unknown:
+            await event.respond(
+                "Categorie non riconosciute: "
+                + ", ".join(unknown)
+                + "\nUsa /category list.",
+                parse_mode=None,
+            )
+            return
+
+        store.set_filter_categories(categories)
+        await event.respond(
+            "Filtro categorie impostato: " + ", ".join(categories),
+            parse_mode=None,
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/price(?:@\w+)?(?:\s|$)"))
+    async def on_price(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+
+        args = command_arg(event.raw_text or "").split()
+        if not args:
+            await event.respond(
+                "Uso:\n/price max 50\n/price min 10\n/price clear",
+                parse_mode=None,
+            )
+            return
+        mode = args[0].lower()
+        if mode == "clear":
+            store.set_filter_price("filter_min_price", None)
+            store.set_filter_price("filter_max_price", None)
+            await event.respond("Filtro prezzo disattivato.", parse_mode=None)
+            return
+        if mode not in {"min", "max"} or len(args) < 2:
+            await event.respond(
+                "Uso:\n/price max 50\n/price min 10\n/price clear",
+                parse_mode=None,
+            )
+            return
+        value = parse_price_limit(args[1])
+        if value is None:
+            await event.respond("Prezzo non valido.", parse_mode=None)
+            return
+        key = "filter_min_price" if mode == "min" else "filter_max_price"
+        store.set_filter_price(key, value)
+        await event.respond(filters_text(store), parse_mode=None)
+
+    @bot.on(events.NewMessage(pattern=r"^/scan_bots(?:@\w+)?(?:\s|$)"))
+    async def on_scan_bots(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+
+        args = command_arg(event.raw_text or "").lower().split()
+        mode = args[0] if args and args[0] in {"offerte", "notizie"} else "offerte"
+        threshold = 2
+        if len(args) > 1 and args[1].isdigit():
+            threshold = int(args[1])
+
+        await event.respond(f"Scansiono i bot visibili per: {mode}...", parse_mode=None)
+        added = []
+        skipped = []
+        async for dialog in source_client.iter_dialogs():
+            entity = dialog.entity
+            if not getattr(entity, "bot", False):
+                continue
+            title = str(dialog.name or entity_title(entity))
+            username = str(getattr(entity, "username", "") or "")
+            score = source_score(title, username, mode)
+            if score < threshold:
+                skipped.append(title)
+                continue
+            save_source_entity(store, entity)
+            added.append((title, username, score, dialog.id))
+
+        state.source_ids = store.source_ids()
+        lines = [f"Scan completato: {len(added)} bot aggiunti per {mode}."]
+        for title, username, score, dialog_id in added[:30]:
+            handle = f" @{username}" if username else ""
+            lines.append(f"- {title}{handle} ({dialog_id}) score={score}")
+        if len(added) > 30:
+            lines.append(f"... e altri {len(added) - 30}")
+        if not added:
+            lines.append("Nessun bot compatibile trovato. Avvia i bot dal tuo account e riprova.")
+        await event.respond("\n".join(lines), parse_mode=None)
+
     @bot.on(events.NewMessage(pattern=r"^/add(?:@\w+)?(?:\s|$)"))
     async def on_add(event: events.NewMessage.Event) -> None:
         if not await is_control_admin(event, settings, store):
@@ -610,6 +917,8 @@ async def register_control_bot(
                     f"Destinazione: {state.destination_ref or 'non impostata'}",
                     f"Monitor all chats: {settings.monitor_all_chats}",
                     f"Dry run: {settings.dry_run}",
+                    "",
+                    filters_text(store),
                 ]
             ),
             parse_mode=None,
@@ -703,6 +1012,52 @@ async def run(settings: Settings | None = None) -> None:
                 )
             except Exception:
                 LOGGER.exception("Could not process incoming message")
+
+        @source_client.on(events.MessageEdited(incoming=True))
+        async def on_edited_message(edited_event: events.MessageEdited.Event) -> None:
+            try:
+                source_id = str(
+                    edited_event.message.chat_id
+                    or utils.get_peer_id(edited_event.message.peer_id)
+                )
+                if not settings.monitor_all_chats and source_id not in state.source_ids:
+                    return
+
+                await handle_message(
+                    message=edited_event.message,
+                    settings=settings,
+                    store=store,
+                    sender=sender,
+                    destination=state.destination,
+                    limiter=limiter,
+                    ignored_chat_ids=state.ignored_chat_ids,
+                    allow_seen_update=True,
+                )
+            except Exception:
+                LOGGER.exception("Could not process edited message")
+
+        @source_client.on(events.MessageDeleted())
+        async def on_deleted_message(deleted_event: events.MessageDeleted.Event) -> None:
+            try:
+                if deleted_event.chat_id is None:
+                    return
+                source_id = str(deleted_event.chat_id)
+                if not settings.monitor_all_chats and source_id not in state.source_ids:
+                    return
+                for deleted_id in deleted_event.deleted_ids:
+                    for fingerprint in store.fingerprints_for_source_message(
+                        source_id,
+                        int(deleted_id),
+                    ):
+                        await delete_offer(
+                            sender,
+                            state.destination,
+                            store,
+                            fingerprint,
+                            "source-deleted",
+                        )
+            except Exception:
+                LOGGER.exception("Could not process deleted message")
 
         LOGGER.info("Shopper Easly bot is online")
         await source_client.run_until_disconnected()
