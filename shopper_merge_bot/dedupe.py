@@ -291,9 +291,14 @@ class DedupeStore:
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)
             ON CONFLICT(fingerprint) DO UPDATE SET
+                destination_chat_id = excluded.destination_chat_id,
+                primary_message_id = excluded.primary_message_id,
+                extra_message_ids = excluded.extra_message_ids,
                 text = excluded.text,
                 category = excluded.category,
                 price = excluded.price,
+                source_count = 1,
+                status = 'active',
                 updated_at = excluded.updated_at
             """,
             (

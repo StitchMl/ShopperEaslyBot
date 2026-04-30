@@ -474,6 +474,8 @@ async def edit_offer_message(
             )
             return True
         except Exception as exc:
+            if "not modified" in str(exc).lower():
+                return True
             LOGGER.warning(
                 "Could not edit offer %s with %s: %s",
                 offer.fingerprint,
@@ -570,12 +572,23 @@ async def purge_legacy_offers(
     for offer in offers:
         if is_structured_offer_text(offer.text):
             continue
+        if (
+            include_marked_deleted
+            and offer.status.startswith("deleted:")
+            and offer.status.endswith(":verified")
+        ):
+            continue
+        reason = (
+            "legacy-format:verified"
+            if include_marked_deleted and offer.status != "active"
+            else "legacy-format"
+        )
         if await delete_offer(
             senders,
             destination,
             store,
             offer.fingerprint,
-            "legacy-format",
+            reason,
             include_inactive=include_marked_deleted,
         ):
             deleted += 1
@@ -600,6 +613,8 @@ async def reformat_active_offers(
         if not is_structured_offer_text(offer.text):
             continue
         styled_body = ensure_offer_body_style(offer.text)
+        if styled_body == offer.text:
+            continue
         rendered = build_offer_publish_text_from_body(
             body=styled_body,
             category=offer.category,
@@ -851,6 +866,9 @@ def control_help(user_id: int | None) -> str:
         "/scan_sources [offerte|notizie] - aggiunge bot, canali e gruppi compatibili",
         "/scan_bots [offerte|notizie] - alias che scansiona tutte le sorgenti",
         "/purge_legacy - elimina offerte pubblicate col vecchio formato",
+        "/purge_legacy hard - ritenta anche vecchie eliminazioni fallite",
+        "/reconcile - sincronizza filtri, merge e formato dei messaggi gia' pubblicati",
+        "/diagnose_destination - prova invio, modifica e cancellazione nella destinazione",
         "/sources - mostra le sorgenti attive",
         "/clear_sources - svuota le sorgenti",
         "/status - stato del servizio",
@@ -1241,20 +1259,119 @@ async def register_control_bot(
             await event.respond("Destinazione non configurata.", parse_mode=None)
             return
 
-        deleted = 0
-        for offer in store.list_active_offers():
-            if is_structured_offer_text(offer.text):
-                continue
-            await delete_offer(
-                bot,
-                state.destination,
-                store,
-                offer.fingerprint,
-                "legacy-format",
-            )
-            deleted += 1
+        include_marked_deleted = command_arg(event.raw_text or "").lower() == "hard"
+        deleted, failed = await purge_legacy_offers(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+            include_marked_deleted=include_marked_deleted,
+        )
         await event.respond(
-            f"Pulizia completata. Messaggi legacy eliminati: {deleted}",
+            f"Pulizia completata. Messaggi legacy eliminati: {deleted}"
+            + (f"\nEliminazioni fallite: {failed}" if failed else ""),
+            parse_mode=None,
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/(reconcile|maintenance)(?:@\w+)?(?:\s|$)"))
+    async def on_reconcile(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+        if state.destination is None:
+            await event.respond("Destinazione non configurata.", parse_mode=None)
+            return
+
+        await event.respond("Riconcilio messaggi pubblicati, filtri e vecchi formati...", parse_mode=None)
+        filtered_deleted, filtered_failed = await purge_filtered_offers(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+        )
+        legacy_deleted, legacy_failed = await purge_legacy_offers(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+            include_marked_deleted=True,
+        )
+        reformatted, reformat_failed = await reformat_active_offers(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+            max_chars=settings.max_text_chars,
+        )
+        await event.respond(
+            "\n".join(
+                [
+                    "Riconciliazione completata.",
+                    f"Fuori filtro eliminati: {filtered_deleted}",
+                    f"Legacy eliminati: {legacy_deleted}",
+                    f"Messaggi riformattati: {reformatted}",
+                    f"Operazioni fallite: {filtered_failed + legacy_failed + reformat_failed}",
+                ]
+            ),
+            parse_mode=None,
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/diagnose_destination(?:@\w+)?(?:\s|$)"))
+    async def on_diagnose_destination(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+        if state.destination is None:
+            await event.respond("Destinazione non configurata.", parse_mode=None)
+            return
+
+        sent_ids: list[int] = []
+        send_ok = False
+        edit_ok = False
+        delete_ok = False
+        error = ""
+        try:
+            result = await bot.send_message(
+                state.destination,
+                "Test Shopper Easly: invio in corso...",
+                parse_mode=None,
+            )
+            sent_ids = _message_ids_from_result(result)
+            send_ok = bool(sent_ids)
+            if send_ok:
+                fake_offer = OfferRecord(
+                    fingerprint="diagnose",
+                    destination_chat_id=destination_peer_id(state.destination),
+                    primary_message_id=sent_ids[0],
+                    extra_message_ids=tuple(sent_ids[1:]),
+                    text="diagnose",
+                    category="diagnose",
+                    price=None,
+                    source_count=1,
+                    status="active",
+                )
+                edit_ok = await edit_offer_message(
+                    cleanup_senders,
+                    state.destination,
+                    fake_offer,
+                    "Test Shopper Easly: modifica riuscita.",
+                )
+                delete_ok = await delete_messages_with_fallback(
+                    cleanup_senders,
+                    state.destination,
+                    sent_ids,
+                )
+        except Exception as exc:
+            error = str(exc)
+
+        await event.respond(
+            "\n".join(
+                [
+                    "Diagnosi destinazione",
+                    f"Invio: {'ok' if send_ok else 'fallito'}",
+                    f"Modifica: {'ok' if edit_ok else 'fallita'}",
+                    f"Cancellazione: {'ok' if delete_ok else 'fallita'}",
+                    (
+                        "Se modifica/cancellazione falliscono, rendi il bot admin della "
+                        "destinazione con permessi di modificare e cancellare messaggi."
+                    ),
+                    f"Errore: {error}" if error else "",
+                ]
+            ).strip(),
             parse_mode=None,
         )
 
@@ -1325,12 +1442,22 @@ async def run(settings: Settings | None = None) -> None:
         state = RuntimeState()
 
         if settings.telegram_bot_token:
+            bot_session_path = settings.database_path.parent / "control_bot"
             sender_client = TelegramClient(
-                StringSession(),
+                str(bot_session_path),
                 settings.telegram_api_id,
                 settings.telegram_api_hash,
             )
-            await sender_client.start(bot_token=settings.telegram_bot_token)
+            while True:
+                try:
+                    await sender_client.start(bot_token=settings.telegram_bot_token)
+                    break
+                except FloodWaitError as exc:
+                    LOGGER.warning(
+                        "Telegram asked to wait %s seconds before bot authorization; sleeping",
+                        exc.seconds,
+                    )
+                    await asyncio.sleep(exc.seconds + 5)
             sender = sender_client
 
         if settings.destination_chat is not None:
@@ -1363,6 +1490,35 @@ async def run(settings: Settings | None = None) -> None:
                 state=state,
             )
 
+        cleanup_senders = unique_clients(sender, source_client)
+        if state.destination is not None:
+            filtered_deleted, filtered_failed = await purge_filtered_offers(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+            )
+            legacy_deleted, legacy_failed = await purge_legacy_offers(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                include_marked_deleted=True,
+            )
+            reformatted, reformat_failed = await reformat_active_offers(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                max_chars=settings.max_text_chars,
+            )
+            LOGGER.info(
+                "Startup reconcile: filtered_deleted=%s filtered_failed=%s "
+                "legacy_deleted=%s legacy_failed=%s reformatted=%s reformat_failed=%s",
+                filtered_deleted,
+                filtered_failed,
+                legacy_deleted,
+                legacy_failed,
+                reformatted,
+                reformat_failed,
+            )
         limiter = RateLimiter(settings.min_post_interval_seconds)
         sources = await resolve_saved_sources(source_client, store)
         await run_backfill(
@@ -1371,6 +1527,7 @@ async def run(settings: Settings | None = None) -> None:
             settings=settings,
             store=store,
             sender=sender,
+            cleanup_senders=cleanup_senders,
             destination=state.destination,
             limiter=limiter,
             ignored_chat_ids=state.ignored_chat_ids,
@@ -1393,6 +1550,7 @@ async def run(settings: Settings | None = None) -> None:
                     settings=settings,
                     store=store,
                     sender=sender,
+                    cleanup_senders=cleanup_senders,
                     destination=state.destination,
                     limiter=limiter,
                     ignored_chat_ids=state.ignored_chat_ids,
@@ -1415,6 +1573,7 @@ async def run(settings: Settings | None = None) -> None:
                     settings=settings,
                     store=store,
                     sender=sender,
+                    cleanup_senders=cleanup_senders,
                     destination=state.destination,
                     limiter=limiter,
                     ignored_chat_ids=state.ignored_chat_ids,
@@ -1437,7 +1596,7 @@ async def run(settings: Settings | None = None) -> None:
                         int(deleted_id),
                     ):
                         await delete_offer(
-                            sender,
+                            cleanup_senders,
                             state.destination,
                             store,
                             fingerprint,
