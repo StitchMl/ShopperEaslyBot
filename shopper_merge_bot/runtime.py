@@ -6,6 +6,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Iterable
 
@@ -14,13 +15,13 @@ from telethon.errors import AccessTokenInvalidError, ApiIdInvalidError, FloodWai
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import Message
+from telethon.tl.types import Channel, Chat, Message, User
 
 from .chat_folder import import_chat_folder
 from .config import ConfigError, Settings, parse_chat_ref
 from .dedupe import DedupeStore, OfferRecord
-from .formatter import build_outbound_text, trim_text
-from .normalization import build_fingerprint
+from .formatter import trim_text
+from .normalization import build_fingerprint, canonicalize_url
 from .offer_analysis import (
     CATEGORY_KEYWORDS,
     analyze_offer,
@@ -39,6 +40,7 @@ class RuntimeState:
     destination_ref: str | None = None
     destination: object | None = None
     ignored_chat_ids: set[str] = field(default_factory=set)
+    control_bot_peer_id: str | None = None
 
 
 class RateLimiter:
@@ -114,9 +116,27 @@ def entity_title(entity: object) -> str:
     )
 
 
+def entity_kind(entity: object) -> str:
+    if isinstance(entity, User) and getattr(entity, "bot", False):
+        return "bot"
+    if isinstance(entity, Channel) and getattr(entity, "broadcast", False):
+        return "channel"
+    if isinstance(entity, (Channel, Chat)):
+        return "group"
+    return "chat"
+
+
+def entity_peer_id(entity: object) -> str:
+    return str(utils.get_peer_id(entity))
+
+
+def is_control_bot_entity(state: RuntimeState, entity: object) -> bool:
+    return state.control_bot_peer_id is not None and entity_peer_id(entity) == state.control_bot_peer_id
+
+
 def save_source_entity(store: DedupeStore, entity: object) -> None:
     store.add_source(
-        peer_id=str(utils.get_peer_id(entity)),
+        peer_id=entity_peer_id(entity),
         title=str(entity_title(entity)),
         username=str(getattr(entity, "username", None) or ""),
     )
@@ -168,13 +188,15 @@ async def refresh_destination(
     state.destination_ref = destination_ref
     state.destination = None
     state.ignored_chat_ids = set()
+    if state.control_bot_peer_id is not None:
+        state.ignored_chat_ids.add(state.control_bot_peer_id)
 
     if not destination_ref:
         return
 
     destination = await sender.get_entity(parse_chat_ref(destination_ref))
     state.destination = destination
-    state.ignored_chat_ids = {str(utils.get_peer_id(destination))}
+    state.ignored_chat_ids.add(entity_peer_id(destination))
 
 
 async def chat_title(message: Message) -> str:
@@ -220,34 +242,142 @@ def destination_peer_id(destination: object) -> str:
     return str(utils.get_peer_id(destination))
 
 
+def format_price(value: object) -> str:
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return f"{value} EUR"
+    return f"{amount:.2f}".replace(".", ",") + " EUR"
+
+
+def savings_line(original_price: object, current_price: object) -> str | None:
+    try:
+        original = Decimal(str(original_price))
+        current = Decimal(str(current_price))
+    except (InvalidOperation, ValueError):
+        return None
+    if original <= 0 or current >= original:
+        return None
+
+    saving = (original - current).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    discount = ((saving / original) * Decimal("100")).quantize(
+        Decimal("1"),
+        rounding=ROUND_HALF_UP,
+    )
+    return f"✅ Risparmio stimato: {format_price(saving)} ({discount}%)"
+
+
 def build_offer_publish_text(
     *,
-    source_title: str,
-    body: str,
-    source_link: str | None,
+    product: str,
+    original_price: object,
+    current_price: object,
+    offer_url: str,
     category: str,
-    price: object | None,
     sources: list[tuple[str, str]],
     max_chars: int,
 ) -> str:
-    text = build_outbound_text(
-        source_title=source_title,
-        body=body,
-        source_link=source_link,
+    text = build_offer_publish_text_from_body(
+        body=stable_offer_body(
+            product=product,
+            original_price=original_price,
+            current_price=current_price,
+            offer_url=offer_url,
+        ),
+        category=category,
+        sources=sources,
         max_chars=max_chars,
     )
-    metadata = [f"Categoria: {category}"]
-    if price is not None:
-        metadata.append(f"Prezzo rilevato: {price} EUR")
+    return text
+
+
+def build_offer_publish_text_from_body(
+    *,
+    body: str,
+    category: str,
+    sources: list[tuple[str, str]],
+    max_chars: int,
+) -> str:
+    text = ensure_offer_body_style(body)
+    if category:
+        text += f"\n\n📂 Categoria: {category}"
     if len(sources) > 1:
-        seen_titles = []
-        for title, _link in sources:
-            if title and title not in seen_titles:
-                seen_titles.append(title)
-        if seen_titles:
-            metadata.append("Visto anche su: " + ", ".join(seen_titles[1:6]))
-    suffix = "\n\n" + "\n".join(metadata)
-    return trim_text(text + suffix, max_chars)
+        text += f"\n🔁 Confermata da {len(sources)} fonti"
+    return trim_text(text, max_chars)
+
+
+def stable_offer_body(*, product: str, original_price: object, current_price: object, offer_url: str) -> str:
+    lines = [
+        "🔥 Offerta pronta da controllare",
+        "",
+        f"📦 Prodotto: {product}",
+        "",
+        f"💸 Prezzo attuale: {format_price(current_price)}",
+        f"🏷️ Prezzo originale: {format_price(original_price)}",
+    ]
+    saving = savings_line(original_price, current_price)
+    if saving:
+        lines.append(saving)
+    lines.extend(["", f"🔗 Link offerta: {offer_url}"])
+    return "\n".join(lines)
+
+
+def ensure_offer_body_style(text: str) -> str:
+    replacements = (
+        ("Offerta pronta da controllare", "🔥 Offerta pronta da controllare"),
+        ("Prodotto:", "📦 Prodotto:"),
+        ("Prezzo attuale:", "💸 Prezzo attuale:"),
+        ("Prezzo originale:", "🏷️ Prezzo originale:"),
+        ("Risparmio stimato:", "✅ Risparmio stimato:"),
+        ("Link offerta:", "🔗 Link offerta:"),
+    )
+    styled_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        for plain, styled in replacements:
+            if stripped == plain or stripped.startswith(f"{plain} "):
+                leading = line[: len(line) - len(line.lstrip())]
+                line = leading + styled + stripped[len(plain) :]
+                break
+        styled_lines.append(line)
+    return "\n".join(styled_lines)
+
+
+def is_structured_offer_text(text: str) -> bool:
+    required_labels = (
+        "Prodotto:",
+        "Prezzo originale:",
+        "Prezzo attuale:",
+        "Link offerta:",
+    )
+    return all(label in text for label in required_labels)
+
+
+def fingerprint_for_offer_url(url: str) -> str:
+    return build_fingerprint(canonicalize_url(url), fallback=url)
+
+
+def message_offer_urls(message: Message) -> tuple[str, ...]:
+    urls = []
+    for url in re.findall(r"https?://[^\s<>()\"']+", message.raw_text or ""):
+        urls.append(url.rstrip(".,;:!?]})"))
+
+    for entity in getattr(message, "entities", None) or []:
+        url = getattr(entity, "url", None)
+        if url:
+            urls.append(str(url))
+
+    for row in getattr(message, "buttons", None) or []:
+        for button in row:
+            url = getattr(button, "url", None)
+            if url:
+                urls.append(str(url))
+
+    deduped = []
+    for url in urls:
+        if url not in deduped:
+            deduped.append(url)
+    return tuple(deduped)
 
 
 def passes_filters(store: DedupeStore, category: str, price: object | None) -> bool:
@@ -294,21 +424,29 @@ async def send_once(
     copy_media: bool,
 ) -> list[int]:
     if copy_media and message.media:
-        with tempfile.TemporaryDirectory(prefix="shopperbot-") as temp_dir:
-            downloaded = await message.download_media(file=temp_dir)
-            if downloaded:
-                caption = trim_text(text, CAPTION_LIMIT)
-                result = await sender.send_file(
-                    destination,
-                    file=Path(downloaded),
-                    caption=caption,
-                    parse_mode=None,
-                )
-                message_ids = _message_ids_from_result(result)
-                if len(text) > CAPTION_LIMIT:
-                    extra = await sender.send_message(destination, text, parse_mode=None)
-                    message_ids.extend(_message_ids_from_result(extra))
-                return message_ids
+        try:
+            with tempfile.TemporaryDirectory(prefix="shopperbot-") as temp_dir:
+                downloaded = await message.download_media(file=temp_dir)
+                if downloaded:
+                    caption = trim_text(text, CAPTION_LIMIT)
+                    result = await sender.send_file(
+                        destination,
+                        file=Path(downloaded),
+                        caption=caption,
+                        parse_mode=None,
+                    )
+                    message_ids = _message_ids_from_result(result)
+                    if len(text) > CAPTION_LIMIT:
+                        extra = await sender.send_message(
+                            destination,
+                            text,
+                            link_preview=True,
+                            parse_mode=None,
+                        )
+                        message_ids.extend(_message_ids_from_result(extra))
+                    return message_ids
+        except Exception:
+            LOGGER.exception("Could not copy source media; sending text-only fallback")
 
     result = await sender.send_message(
         destination,
@@ -320,40 +458,161 @@ async def send_once(
 
 
 async def edit_offer_message(
-    sender: TelegramClient,
+    senders: Iterable[TelegramClient],
     destination: object,
     offer: OfferRecord,
     text: str,
-) -> None:
-    try:
-        await sender.edit_message(
-            destination,
-            offer.primary_message_id,
-            trim_text(text, 3500),
-            parse_mode=None,
-            link_preview=True,
-        )
-    except Exception:
-        LOGGER.exception("Could not edit merged offer %s", offer.fingerprint)
+) -> bool:
+    for sender in senders:
+        try:
+            await sender.edit_message(
+                destination,
+                offer.primary_message_id,
+                trim_text(text, CAPTION_LIMIT),
+                parse_mode=None,
+                link_preview=True,
+            )
+            return True
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not edit offer %s with %s: %s",
+                offer.fingerprint,
+                sender.session.__class__.__name__,
+                exc,
+            )
+    return False
+
+
+async def delete_messages_with_fallback(
+    senders: Iterable[TelegramClient],
+    destination: object,
+    ids: list[int],
+) -> bool:
+    for sender in senders:
+        try:
+            await sender.delete_messages(destination, ids)
+            return True
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not delete messages %s with %s: %s",
+                ids,
+                sender.session.__class__.__name__,
+                exc,
+            )
+    return False
 
 
 async def delete_offer(
-    sender: TelegramClient,
+    senders: Iterable[TelegramClient],
     destination: object | None,
     store: DedupeStore,
     fingerprint: str,
     reason: str,
-) -> None:
+    *,
+    include_inactive: bool = False,
+) -> bool:
     offer = store.get_offer(fingerprint)
-    if offer is None or offer.status != "active":
-        return
-    if destination is not None:
-        ids = [offer.primary_message_id, *offer.extra_message_ids]
-        try:
-            await sender.delete_messages(destination, ids)
-        except Exception:
-            LOGGER.exception("Could not delete offer %s", fingerprint)
+    if offer is None:
+        return False
+    if offer.status != "active" and not include_inactive:
+        return False
+    if destination is None:
+        LOGGER.warning("Could not delete offer %s because destination is not configured", fingerprint)
+        return False
+
+    ids = [offer.primary_message_id, *offer.extra_message_ids]
+    if not await delete_messages_with_fallback(senders, destination, ids):
+        LOGGER.error("Could not delete offer %s after trying all clients", fingerprint)
+        return False
+
     store.mark_offer_status(fingerprint, f"deleted:{reason}")
+    return True
+
+
+def fingerprints_from_urls(urls: Iterable[str]) -> set[str]:
+    return {fingerprint_for_offer_url(url) for url in urls if url}
+
+
+async def purge_filtered_offers(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object | None,
+    store: DedupeStore,
+) -> tuple[int, int]:
+    deleted = 0
+    failed = 0
+    for offer in store.list_active_offers():
+        if passes_filters(store, offer.category, offer.price):
+            continue
+        if await delete_offer(
+            senders,
+            destination,
+            store,
+            offer.fingerprint,
+            "filter-changed",
+        ):
+            deleted += 1
+        else:
+            failed += 1
+    return deleted, failed
+
+
+async def purge_legacy_offers(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object | None,
+    store: DedupeStore,
+    include_marked_deleted: bool = False,
+) -> tuple[int, int]:
+    deleted = 0
+    failed = 0
+    offers = store.list_offers(None if include_marked_deleted else "active")
+    for offer in offers:
+        if is_structured_offer_text(offer.text):
+            continue
+        if await delete_offer(
+            senders,
+            destination,
+            store,
+            offer.fingerprint,
+            "legacy-format",
+            include_inactive=include_marked_deleted,
+        ):
+            deleted += 1
+        else:
+            failed += 1
+    return deleted, failed
+
+
+async def reformat_active_offers(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object | None,
+    store: DedupeStore,
+    max_chars: int,
+) -> tuple[int, int]:
+    if destination is None:
+        return 0, len(store.list_active_offers())
+
+    updated = 0
+    failed = 0
+    for offer in store.list_active_offers():
+        if not is_structured_offer_text(offer.text):
+            continue
+        styled_body = ensure_offer_body_style(offer.text)
+        rendered = build_offer_publish_text_from_body(
+            body=styled_body,
+            category=offer.category,
+            sources=store.offer_sources(offer.fingerprint),
+            max_chars=max_chars,
+        )
+        if await edit_offer_message(senders, destination, offer, rendered):
+            if styled_body != offer.text:
+                store.update_offer_text(offer.fingerprint, styled_body, offer.source_count)
+            updated += 1
+        else:
+            failed += 1
+    return updated, failed
 
 
 async def handle_message(
@@ -362,6 +621,7 @@ async def handle_message(
     settings: Settings,
     store: DedupeStore,
     sender: TelegramClient,
+    cleanup_senders: tuple[TelegramClient, ...],
     destination: object | None,
     limiter: RateLimiter,
     ignored_chat_ids: set[str],
@@ -383,14 +643,34 @@ async def handle_message(
         store.mark_message(source_id, message_id)
         return
 
-    facts = analyze_offer(raw_text)
+    offer_urls = message_offer_urls(message)
+    mapped_fingerprints = set(store.fingerprints_for_source_message(source_id, message_id))
+    facts = analyze_offer(raw_text, offer_urls)
     if facts.invalid:
-        for fingerprint in store.fingerprints_for_source_message(source_id, message_id):
-            await delete_offer(sender, destination, store, fingerprint, "invalid-source-edit")
+        expired_fingerprints = mapped_fingerprints | fingerprints_from_urls(offer_urls)
+        for fingerprint in expired_fingerprints:
+            await delete_offer(
+                cleanup_senders,
+                destination,
+                store,
+                fingerprint,
+                "invalid-source-edit",
+            )
         store.mark_message(source_id, message_id)
         return
 
-    if allow_seen_update and store.fingerprints_for_source_message(source_id, message_id):
+    if not facts.complete:
+        if allow_seen_update:
+            for fingerprint in mapped_fingerprints:
+                await delete_offer(
+                    cleanup_senders,
+                    destination,
+                    store,
+                    fingerprint,
+                    "incomplete-source-edit",
+                )
+        store.mark_message(source_id, message_id)
+        LOGGER.info("Incomplete offer skipped from %s/%s", source_id, message_id)
         return
 
     if store.has_message(source_id, message_id) and not allow_seen_update:
@@ -404,9 +684,18 @@ async def handle_message(
         store.mark_message(source_id, message_id)
         return
 
-    link = await source_permalink(message) if settings.include_source_link else None
+    source_link = await source_permalink(message) if settings.include_source_link else None
     title = await chat_title(message)
     if not passes_filters(store, facts.category, facts.price):
+        if allow_seen_update:
+            for fingerprint in mapped_fingerprints:
+                await delete_offer(
+                    cleanup_senders,
+                    destination,
+                    store,
+                    fingerprint,
+                    "source-edited-filtered",
+                )
         LOGGER.info(
             "Filtered message from %s/%s category=%s price=%s",
             source_id,
@@ -417,7 +706,23 @@ async def handle_message(
         store.mark_message(source_id, message_id)
         return
 
-    fingerprint = build_fingerprint(raw_text, fallback=f"{source_id}:{message_id}")
+    fingerprint = fingerprint_for_offer_url(str(facts.offer_url))
+    normalized_body = stable_offer_body(
+        product=str(facts.product),
+        original_price=facts.original_price,
+        current_price=facts.current_price,
+        offer_url=str(facts.offer_url),
+    )
+    stale_fingerprints = mapped_fingerprints - {fingerprint}
+    for stale_fingerprint in stale_fingerprints:
+        await delete_offer(
+            cleanup_senders,
+            destination,
+            store,
+            stale_fingerprint,
+            "source-edited-new-offer",
+        )
+
     existing = store.get_offer(fingerprint)
     if existing and existing.status == "active":
         added = store.add_offer_source(
@@ -425,33 +730,30 @@ async def handle_message(
             source_chat_id=source_id,
             source_message_id=message_id,
             source_title=title,
-            source_link=link or "",
+            source_link=source_link or "",
         )
         store.mark_message(source_id, message_id)
         if added:
             sources = store.offer_sources(fingerprint)
-            merged = build_offer_publish_text(
-                source_title=sources[0][0] if sources else title,
+            merged = build_offer_publish_text_from_body(
                 body=existing.text,
-                source_link=sources[0][1] if sources else link,
                 category=existing.category,
-                price=existing.price,
                 sources=sources,
                 max_chars=settings.max_text_chars,
             )
             store.update_offer_text(fingerprint, existing.text, len(sources))
             if not settings.dry_run:
-                await edit_offer_message(sender, destination, existing, merged)
+                await edit_offer_message(cleanup_senders, destination, existing, merged)
             LOGGER.info("Merged duplicate offer %s from %s/%s", fingerprint, source_id, message_id)
         return
 
     outbound = build_offer_publish_text(
-        source_title=title,
-        body=raw_text,
-        source_link=link,
+        product=str(facts.product),
+        original_price=facts.original_price,
+        current_price=facts.current_price,
+        offer_url=str(facts.offer_url),
         category=facts.category,
-        price=facts.price,
-        sources=[(title, link or "")],
+        sources=[(title, source_link or "")],
         max_chars=settings.max_text_chars,
     )
 
@@ -474,7 +776,7 @@ async def handle_message(
                 destination_chat_id=destination_peer_id(destination),
                 primary_message_id=message_ids[0],
                 extra_message_ids=tuple(message_ids[1:]),
-                text=raw_text,
+                text=normalized_body,
                 category=facts.category,
                 price=facts.price,
             )
@@ -483,7 +785,7 @@ async def handle_message(
                 source_chat_id=source_id,
                 source_message_id=message_id,
                 source_title=title,
-                source_link=link or "",
+                source_link=source_link or "",
             )
         store.mark_message(source_id, message_id)
         LOGGER.info("Delivered message from %s/%s", source_id, message_id)
@@ -498,6 +800,7 @@ async def run_backfill(
     settings: Settings,
     store: DedupeStore,
     sender: TelegramClient,
+    cleanup_senders: tuple[TelegramClient, ...],
     destination: object | None,
     limiter: RateLimiter,
     ignored_chat_ids: set[str],
@@ -517,6 +820,7 @@ async def run_backfill(
                 settings=settings,
                 store=store,
                 sender=sender,
+                cleanup_senders=cleanup_senders,
                 destination=destination,
                 limiter=limiter,
                 ignored_chat_ids=ignored_chat_ids,
@@ -544,7 +848,9 @@ def control_help(user_id: int | None) -> str:
         "/filters - mostra filtri categoria/prezzo",
         "/category <nomi|clear|list> - filtra per categoria",
         "/price <min|max|clear> [valore] - filtra per prezzo",
-        "/scan_bots [offerte|notizie] - aggiunge bot compatibili gia' visibili",
+        "/scan_sources [offerte|notizie] - aggiunge bot, canali e gruppi compatibili",
+        "/scan_bots [offerte|notizie] - alias che scansiona tutte le sorgenti",
+        "/purge_legacy - elimina offerte pubblicate col vecchio formato",
         "/sources - mostra le sorgenti attive",
         "/clear_sources - svuota le sorgenti",
         "/status - stato del servizio",
@@ -568,6 +874,14 @@ def filters_text(store: DedupeStore) -> str:
             ", ".join(sorted(CATEGORY_KEYWORDS.keys()) + ["altro"]),
         ]
     )
+
+
+def unique_clients(*clients: TelegramClient) -> tuple[TelegramClient, ...]:
+    unique = []
+    for client in clients:
+        if not any(client is existing for existing in unique):
+            unique.append(client)
+    return tuple(unique)
 
 
 async def is_control_admin(
@@ -595,6 +909,8 @@ async def register_control_bot(
     store: DedupeStore,
     state: RuntimeState,
 ) -> None:
+    cleanup_senders = unique_clients(bot, source_client)
+
     @bot.on(events.NewMessage(pattern=r"^/(start|help)(?:@\w+)?(?:\s|$)"))
     async def on_help(event: events.NewMessage.Event) -> None:
         await event.respond(control_help(event.sender_id), parse_mode=None)
@@ -688,6 +1004,8 @@ async def register_control_bot(
             return
 
         for source in result.sources:
+            if source.peer_id == state.control_bot_peer_id:
+                continue
             store.add_source(source.peer_id, source.title, source.username)
 
         state.source_ids = store.source_ids()
@@ -715,12 +1033,14 @@ async def register_control_bot(
         matches = []
         async for dialog in source_client.iter_dialogs():
             entity = dialog.entity
+            if is_control_bot_entity(state, entity):
+                continue
             title = str(dialog.name or entity_title(entity))
             username = str(getattr(entity, "username", "") or "")
             searchable = f"{title} {username} {dialog.id}".lower()
             if query not in searchable:
                 continue
-            kind = "bot" if getattr(entity, "bot", False) else "chat"
+            kind = entity_kind(entity)
             matches.append((title, username, dialog.id, kind))
             if len(matches) >= 30:
                 break
@@ -775,8 +1095,16 @@ async def register_control_bot(
             return
 
         store.set_filter_categories(categories)
+        deleted, failed = await purge_filtered_offers(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+        )
         await event.respond(
-            "Filtro categorie impostato: " + ", ".join(categories),
+            "Filtro categorie impostato: "
+            + ", ".join(categories)
+            + f"\nOfferte gia' pubblicate rimosse: {deleted}"
+            + (f"\nRimozioni fallite: {failed}" if failed else ""),
             parse_mode=None,
         )
 
@@ -810,10 +1138,20 @@ async def register_control_bot(
             return
         key = "filter_min_price" if mode == "min" else "filter_max_price"
         store.set_filter_price(key, value)
-        await event.respond(filters_text(store), parse_mode=None)
+        deleted, failed = await purge_filtered_offers(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+        )
+        await event.respond(
+            filters_text(store)
+            + f"\n\nOfferte gia' pubblicate rimosse: {deleted}"
+            + (f"\nRimozioni fallite: {failed}" if failed else ""),
+            parse_mode=None,
+        )
 
-    @bot.on(events.NewMessage(pattern=r"^/scan_bots(?:@\w+)?(?:\s|$)"))
-    async def on_scan_bots(event: events.NewMessage.Event) -> None:
+    @bot.on(events.NewMessage(pattern=r"^/(scan_sources|scan_bots)(?:@\w+)?(?:\s|$)"))
+    async def on_scan_sources(event: events.NewMessage.Event) -> None:
         if not await is_control_admin(event, settings, store):
             return
 
@@ -823,31 +1161,39 @@ async def register_control_bot(
         if len(args) > 1 and args[1].isdigit():
             threshold = int(args[1])
 
-        await event.respond(f"Scansiono i bot visibili per: {mode}...", parse_mode=None)
+        await event.respond(
+            f"Scansiono bot, canali e gruppi visibili per: {mode}...",
+            parse_mode=None,
+        )
         added = []
         skipped = []
         async for dialog in source_client.iter_dialogs():
             entity = dialog.entity
-            if not getattr(entity, "bot", False):
+            if is_control_bot_entity(state, entity):
                 continue
+            peer_id = entity_peer_id(entity)
             title = str(dialog.name or entity_title(entity))
             username = str(getattr(entity, "username", "") or "")
-            score = source_score(title, username, mode)
+            kind = entity_kind(entity)
+            score = source_score(title, username, mode, kind)
             if score < threshold:
                 skipped.append(title)
                 continue
             save_source_entity(store, entity)
-            added.append((title, username, score, dialog.id))
+            added.append((title, username, score, peer_id, kind))
 
         state.source_ids = store.source_ids()
-        lines = [f"Scan completato: {len(added)} bot aggiunti per {mode}."]
-        for title, username, score, dialog_id in added[:30]:
+        lines = [f"Scan completato: {len(added)} sorgenti aggiunte per {mode}."]
+        for title, username, score, dialog_id, kind in added[:40]:
             handle = f" @{username}" if username else ""
-            lines.append(f"- {title}{handle} ({dialog_id}) score={score}")
-        if len(added) > 30:
-            lines.append(f"... e altri {len(added) - 30}")
+            lines.append(f"- [{kind}] {title}{handle} ({dialog_id}) score={score}")
+        if len(added) > 40:
+            lines.append(f"... e altre {len(added) - 40}")
         if not added:
-            lines.append("Nessun bot compatibile trovato. Avvia i bot dal tuo account e riprova.")
+            lines.append(
+                "Nessuna sorgente compatibile trovata. Usa /find o abbassa soglia: "
+                "/scan_sources offerte 1"
+            )
         await event.respond("\n".join(lines), parse_mode=None)
 
     @bot.on(events.NewMessage(pattern=r"^/add(?:@\w+)?(?:\s|$)"))
@@ -870,10 +1216,45 @@ async def register_control_bot(
             await event.respond(f"Non riesco ad aggiungere la sorgente: {exc}", parse_mode=None)
             return
 
+        if is_control_bot_entity(state, entity):
+            store.remove_source(entity_peer_id(entity))
+            state.source_ids.discard(entity_peer_id(entity))
+            await event.respond(
+                "Non posso aggiungere il bot aggregatore come sorgente: verrebbe letto "
+                "di nuovo dai suoi stessi messaggi.",
+                parse_mode=None,
+            )
+            return
+
         save_source_entity(store, entity)
         state.source_ids = store.source_ids()
         await event.respond(
-            f"Sorgente aggiunta: {entity_title(entity)} ({utils.get_peer_id(entity)})",
+            f"Sorgente aggiunta: {entity_title(entity)} ({entity_peer_id(entity)})",
+            parse_mode=None,
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/purge_legacy(?:@\w+)?(?:\s|$)"))
+    async def on_purge_legacy(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+        if state.destination is None:
+            await event.respond("Destinazione non configurata.", parse_mode=None)
+            return
+
+        deleted = 0
+        for offer in store.list_active_offers():
+            if is_structured_offer_text(offer.text):
+                continue
+            await delete_offer(
+                bot,
+                state.destination,
+                store,
+                offer.fingerprint,
+                "legacy-format",
+            )
+            deleted += 1
+        await event.respond(
+            f"Pulizia completata. Messaggi legacy eliminati: {deleted}",
             parse_mode=None,
         )
 
@@ -968,6 +1349,12 @@ async def run(settings: Settings | None = None) -> None:
         await refresh_destination(sender, store, state)
 
         if sender_client is not None:
+            bot_self = await sender_client.get_me()
+            state.control_bot_peer_id = entity_peer_id(bot_self)
+            state.ignored_chat_ids.add(state.control_bot_peer_id)
+            store.remove_source(state.control_bot_peer_id)
+            state.source_ids.discard(state.control_bot_peer_id)
+            LOGGER.info("Excluding control bot from sources: %s", state.control_bot_peer_id)
             await register_control_bot(
                 bot=sender_client,
                 source_client=source_client,

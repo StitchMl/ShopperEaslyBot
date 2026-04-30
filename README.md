@@ -111,6 +111,27 @@ Se non conosci username o ID, cerca tra i dialoghi del tuo account:
 
 Il bot risponde con righe gia' pronte tipo `/add 123456789`.
 
+Per far scegliere automaticamente al bot tutte le sorgenti gia' visibili dal
+tuo account, inclusi bot, canali e gruppi:
+
+```text
+/scan_sources offerte
+```
+
+Per cercare sorgenti di notizie:
+
+```text
+/scan_sources notizie
+```
+
+Se vuoi essere piu' permissivo nello scoring:
+
+```text
+/scan_sources offerte 1
+```
+
+`/scan_bots` resta disponibile come alias, ma ora scansiona tutte le sorgenti.
+
 ## Avvio locale
 
 ```powershell

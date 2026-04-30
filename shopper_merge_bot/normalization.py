@@ -18,7 +18,20 @@ TRACKING_PARAMS = {
     "ref",
     "ref_",
     "spm",
+    "tag",
+    "ascsubtag",
+    "linkcode",
+    "camp",
+    "creative",
+    "creativeasin",
+    "dib",
+    "dib_tag",
+    "keywords",
+    "qid",
+    "sr",
 }
+
+AMAZON_ASIN_RE = re.compile(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:[/?]|$)", re.IGNORECASE)
 
 
 def extract_urls(text: str) -> list[str]:
@@ -30,6 +43,11 @@ def canonicalize_url(url: str) -> str:
     scheme = parts.scheme.lower() or "https"
     netloc = parts.netloc.lower()
     path = parts.path.rstrip("/") or "/"
+
+    if "amazon." in netloc:
+        asin_match = AMAZON_ASIN_RE.search(path)
+        if asin_match:
+            return urlunsplit(("https", netloc.removeprefix("www."), f"/dp/{asin_match.group(1).upper()}", "", ""))
 
     query_items = []
     for key, value in parse_qsl(parts.query, keep_blank_values=True):

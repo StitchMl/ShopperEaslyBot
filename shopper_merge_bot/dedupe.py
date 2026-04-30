@@ -132,6 +132,12 @@ class DedupeStore:
             (peer_id, title, username, int(time.time())),
         )
 
+    def remove_source(self, peer_id: str) -> None:
+        self._conn.execute(
+            "DELETE FROM source_chats WHERE peer_id = ?",
+            (peer_id,),
+        )
+
     def clear_sources(self) -> None:
         self._conn.execute("DELETE FROM source_chats")
 
@@ -213,6 +219,50 @@ class DedupeStore:
             status=str(row[8]),
         )
 
+    def list_offers(self, status: str | None = "active") -> list[OfferRecord]:
+        where = "WHERE status = ?" if status is not None else ""
+        params = (status,) if status is not None else ()
+        rows = self._conn.execute(
+            f"""
+            SELECT
+                fingerprint,
+                destination_chat_id,
+                primary_message_id,
+                extra_message_ids,
+                text,
+                category,
+                price,
+                source_count,
+                status
+            FROM offers
+            {where}
+            ORDER BY updated_at DESC
+            """,
+            params,
+        ).fetchall()
+        offers = []
+        for row in rows:
+            extra_ids = tuple(
+                int(item) for item in str(row[3]).split(",") if item.strip().isdigit()
+            )
+            offers.append(
+                OfferRecord(
+                    fingerprint=str(row[0]),
+                    destination_chat_id=str(row[1]),
+                    primary_message_id=int(row[2]),
+                    extra_message_ids=extra_ids,
+                    text=str(row[4]),
+                    category=str(row[5]),
+                    price=Decimal(str(row[6])) if row[6] else None,
+                    source_count=int(row[7]),
+                    status=str(row[8]),
+                )
+            )
+        return offers
+
+    def list_active_offers(self) -> list[OfferRecord]:
+        return self.list_offers("active")
+
     def save_offer(
         self,
         *,
@@ -267,6 +317,26 @@ class DedupeStore:
             WHERE fingerprint = ?
             """,
             (text, source_count, int(time.time()), fingerprint),
+        )
+
+    def update_offer_delivery(
+        self,
+        fingerprint: str,
+        primary_message_id: int,
+        extra_message_ids: tuple[int, ...],
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE offers
+            SET primary_message_id = ?, extra_message_ids = ?, updated_at = ?
+            WHERE fingerprint = ?
+            """,
+            (
+                primary_message_id,
+                ",".join(str(item) for item in extra_message_ids),
+                int(time.time()),
+                fingerprint,
+            ),
         )
 
     def mark_offer_status(self, fingerprint: str, status: str) -> None:

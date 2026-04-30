@@ -29,3 +29,13 @@ class NormalizationTest(unittest.TestCase):
         first = build_fingerprint("https://example.com/a?utm_campaign=x&id=42", "a")
         second = build_fingerprint("https://example.com/a?id=42&utm_source=y", "b")
         self.assertEqual(first, second)
+
+    def test_amazon_url_canonicalizes_to_asin(self) -> None:
+        first = canonicalize_url(
+            "https://www.amazon.it/Prodotto-Bello/dp/B0ABCDEF12?tag=foo-21&psc=1"
+        )
+        second = canonicalize_url(
+            "https://amazon.it/gp/product/B0ABCDEF12?tag=bar-21&linkCode=abc"
+        )
+        self.assertEqual(first, "https://amazon.it/dp/B0ABCDEF12")
+        self.assertEqual(first, second)
