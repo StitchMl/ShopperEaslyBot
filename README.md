@@ -65,7 +65,7 @@ ADMIN_USER_IDS=
 DATABASE_PATH=/data/shopperbot.sqlite3
 ```
 
-Se `TELEGRAM_BOT_TOKEN` e' vuoto, i messaggi vengono inviati dal tuo account.
+Se `TELEGRAM_BOT_TOKEN` è vuoto, i messaggi vengono inviati dal tuo account.
 Se lo imposti, vengono inviati dal bot e puoi controllarlo via comandi Telegram.
 In locale puoi usare `DATABASE_PATH=data/shopperbot.sqlite3`; nel cloud usa un
 volume persistente, per esempio `/data/shopperbot.sqlite3`.
@@ -158,11 +158,11 @@ Railway. Comando container:
 python -m shopper_merge_bot
 ```
 
-Health check HTTP non necessario: e' un worker Telegram, non un sito web.
+Health check HTTP non necessario: è un worker Telegram, non un sito web.
 
 ## Note di sicurezza
 
-- Rigenera con BotFather ogni token che e' stato salvato in chiaro nel vecchio
+- Rigenera con BotFather ogni token che è stato salvato in chiaro nel vecchio
   script.
 - `TELEGRAM_SESSION` equivale a una sessione login del tuo account: trattala
   come una password.

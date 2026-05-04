@@ -6,7 +6,7 @@ sempre acceso.
 
 ## Opzione consigliata: Fly.io
 
-Fly.io e' comodo per questo progetto perche' deploya direttamente il Dockerfile
+Fly.io è comodo per questo progetto perché deploya direttamente il Dockerfile
 dalla cartella locale e supporta Machines con volume persistente.
 
 1. Installa `flyctl` su Windows:
@@ -31,7 +31,7 @@ cd "C:\Users\matte\Documents\New project"
 .\scripts\deploy_fly.ps1 -AppName shoppereaslybot
 ```
 
-Se il nome app e' gia' preso:
+Se il nome app è gia' preso:
 
 ```powershell
 .\scripts\deploy_fly.ps1 -AppName shoppereaslybot-matteo

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import re
-import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
+import unicodedata
 
 URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
 TRACKING_PARAMS = {
@@ -32,6 +33,13 @@ TRACKING_PARAMS = {
 }
 
 AMAZON_ASIN_RE = re.compile(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:[/?]|$)", re.IGNORECASE)
+REDIRECT_HOSTS = {
+    "amzlink.to",
+    "amzn.to",
+    "bit.ly",
+    "cutt.ly",
+    "tinyurl.com",
+}
 
 
 def extract_urls(text: str) -> list[str]:
@@ -58,6 +66,34 @@ def canonicalize_url(url: str) -> str:
 
     query = urlencode(sorted(query_items), doseq=True)
     return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def should_resolve_redirect(url: str) -> bool:
+    try:
+        netloc = urlsplit(url.strip()).netloc.lower()
+    except ValueError:
+        return False
+    return netloc.removeprefix("www.") in REDIRECT_HOSTS
+
+
+def resolve_redirect_url(url: str, timeout_seconds: float = 8.0) -> str:
+    if not should_resolve_redirect(url):
+        return url
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+            )
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            return response.geturl() or url
+    except (ValueError, OSError):
+        return url
 
 
 def normalize_text(text: str) -> str:

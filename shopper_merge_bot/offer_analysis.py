@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 
 from .normalization import canonicalize_url, extract_urls
 
@@ -20,11 +21,67 @@ INVALID_PATTERNS = (
     r"\bexpired\b",
     r"non\s+(?:piu\s+)?disponibile",
     r"offerta\s+(?:non\s+)?(?:piu\s+)?valida",
+    r"offerta\s+(?:chiusa|finita|esaurita)",
+    r"deal\s+(?:chiuso|finito|expired)",
     r"coupon\s+(?:non\s+)?(?:piu\s+)?valido",
+    r"codice\s+(?:scaduto|non\s+valido)",
+    r"link\s+(?:non\s+)?(?:piu\s+)?valido",
     r"prezzo\s+(?:salito|aumentato|cambiato)",
+    r"\bestrazione\s+finale\b",
+    r"\bfunzionario\s+camerale\b",
+    r"\bregolamento\s+qui\b",
+    r"\bnotaio\b",
+)
+
+MEDIA_URL_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
+    ".avif",
+    ".mp4",
+    ".webm",
+)
+MEDIA_URL_HOSTS = (
+    "res.cloudinary.com",
+    "images-na.ssl-images-amazon.com",
+    "m.media-amazon.com",
 )
 
 CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "accessori": (
+        "accessori",
+        "accessorio",
+        "borsa per fotocamera",
+        "borsa fotocamera",
+        "borsa per camera",
+        "borsa camera",
+        "borsa per laptop",
+        "borsa laptop",
+        "borsa per notebook",
+        "borsa notebook",
+        "borsa per tablet",
+        "borsa tablet",
+        "borsa pc",
+        "custodia",
+        "custodie",
+        "cover",
+        "case",
+        "protezione schermo",
+        "pellicola",
+        "vetro temperato",
+        "supporto tv",
+        "supporto televisore",
+        "supporto monitor",
+        "supporto parete",
+        "supporto da parete",
+        "staffa tv",
+        "staffa per tv",
+        "wall mount",
+        "otterbox",
+        "lowepro",
+    ),
     "elettronica": (
         "smartphone",
         "telefono",
@@ -38,19 +95,63 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "monitor",
         "ssd",
         "hard disk",
+        "microsd",
+        "micro sd",
+        "scheda sd",
+        "scheda memoria",
+        "memory card",
         "router",
+        "wi-fi",
+        "wifi",
+        "internet",
+        "mbps",
+        "rete 5g",
+        "5g",
         "cuffie",
         "auricolari",
         "speaker",
         "bluetooth",
         "tv",
         "televisore",
+        "magsafe",
+        "caricatore",
+        "powerbank",
+        "cavo usb",
+        "usb-c",
         "fotocamera",
-        "camera",
+        "telecamera",
+        "videocamera",
+        "proiettore",
+        "projector",
         "console",
         "playstation",
         "xbox",
         "nintendo",
+        "apple",
+        "anker",
+        "ugreen",
+        "sandisk",
+        "logitech",
+        "tp-link",
+        "tplink",
+        "huawei",
+        "honor",
+        "oppo",
+        "realme",
+        "oneplus",
+        "lenovo",
+        "asus",
+        "acer",
+        "hp",
+        "bose",
+        "sony",
+        "jbl",
+        "soundbar",
+        "mouse",
+        "tastiera",
+        "stampante",
+        "smartwatch",
+        "drone",
     ),
     "casa": (
         "casa",
@@ -58,19 +159,56 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "friggitrice",
         "air fryer",
         "aspirapolvere",
+        "cappa",
+        "cappe",
+        "filtro cappa",
+        "filtri cappa",
         "robot",
         "lavatrice",
         "lavastoviglie",
+        "forno",
+        "microonde",
+        "pentola",
+        "pentole",
+        "padella",
+        "padelle",
+        "pirofile",
+        "alluminio",
+        "tazza",
+        "bottiglia",
+        "organizer",
         "materasso",
         "lenzuola",
         "divano",
         "sedia",
         "lampada",
         "giardino",
-        "bricolage",
-        "utensile",
-        "trapano",
         "bosch",
+        "contenitore",
+        "scatola",
+        "copriletto",
+        "cuscino",
+        "coperta",
+        "tappeto",
+        "zanzariera",
+        "zanzariera magnetica",
+        "rete fine",
+        "tenda",
+        "appendiabiti",
+        "mensola",
+        "scaffale",
+        "scarpiera",
+        "portascarpe",
+        "portaoggetti",
+        "guardaroba",
+        "cassettiera",
+        "cassetti",
+        "mobile",
+        "armadio",
+        "pulizia",
+        "detersivo",
+        "ammorbidente",
+        "candela",
     ),
     "moda": (
         "scarpe",
@@ -81,10 +219,40 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "jeans",
         "borsa",
         "zaino",
+        "zainetto",
         "orologio",
         "abbigliamento",
         "moda",
         "vestito",
+        "intimo",
+        "pantaloni",
+        "camicia",
+        "cappotto",
+        "giubbotto",
+        "giacchetto",
+        "jacket",
+        "impermeabile",
+        "waterproof",
+        "cappuccio",
+        "polsini",
+        "poliestere",
+        "calze",
+        "calzini",
+        "t-shirt",
+        "t shirt",
+        "polo",
+        "shorts",
+        "slip",
+        "reggiseno",
+        "cintura",
+        "portafoglio",
+        "costume",
+        "travestimento",
+        "occhiali",
+        "occhiali da sole",
+        "unisex",
+        "uomo",
+        "donna",
     ),
     "bellezza": (
         "beauty",
@@ -97,6 +265,23 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "cosmetico",
         "makeup",
         "trimmer",
+        "phon",
+        "epilatore",
+        "piastra capelli",
+        "deodorante",
+        "dentifricio",
+        "integratore",
+        "collagene",
+        "protezione solare",
+        "solare",
+        "maschera viso",
+        "siero",
+        "balsamo",
+        "spazzola",
+        "oral-b",
+        "gillette",
+        "braun",
+        "remington",
     ),
     "sport": (
         "sport",
@@ -109,6 +294,14 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "trekking",
         "calcio",
         "padel",
+        "yoga",
+        "manubri",
+        "pesi",
+        "tuta",
+        "scarpe running",
+        "racchetta",
+        "campeggio",
+        "zaino trekking",
     ),
     "giochi": (
         "lego",
@@ -116,9 +309,48 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "giochi",
         "giocattolo",
         "boardgame",
-        "bambini",
         "puzzle",
         "nerf",
+        "pokemon",
+        "barbie",
+        "action figure",
+        "peluche",
+        "carte collezionabili",
+        "star wars",
+        "hello kitty",
+        "disney",
+        "marvel",
+        "playmobil",
+        "hot wheels",
+        "bambola",
+        "bambole",
+        "costruzioni",
+    ),
+    "infanzia": (
+        "prima infanzia",
+        "neonato",
+        "neonati",
+        "bambini",
+        "bambino",
+        "bambina",
+        "pannolini",
+        "pannolino",
+        "teli cambio",
+        "telo cambio",
+        "traversine",
+        "traversina",
+        "seggiolino",
+        "seggiolini",
+        "seggiolone",
+        "passeggino",
+        "lettino",
+        "fasciatoio",
+        "ciuccio",
+        "biberon",
+        "cybex",
+        "pallas",
+        "dodot",
+        "babylino",
     ),
     "libri": (
         "libro",
@@ -126,6 +358,14 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "kindle",
         "ebook",
         "audible",
+        "manuale",
+        "manuali",
+        "edizione",
+        "autore",
+        "pagine",
+        "saggio",
+        "scienza",
+        "cultura",
         "fumetto",
         "manga",
     ),
@@ -133,32 +373,316 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "auto",
         "moto",
         "casco",
+        "automotive",
+        "tergicristallo",
+        "batteria auto",
+        "portapacchi",
+        "supporto smartphone auto",
         "dashcam",
         "pneumatici",
         "olio motore",
         "avviatore",
+        "compressore",
+        "carplay",
+        "autoradio",
+        "lavavetri",
+        "coprisedile",
+        "catene neve",
+    ),
+    "viaggi": (
+        "viaggi",
+        "viaggio",
+        "valigia",
+        "valigie",
+        "trolley",
+        "bagaglio",
+        "bagagli",
+        "lucchetto tsa",
+        "lucchetto",
+        "tsa",
+        "scomparto laptop",
+        "cinghie di compressione",
+        "capacita",
+        "capacità",
+    ),
+    "fai-da-te": (
+        "fai da te",
+        "bricolage",
+        "ferramenta",
+        "viti",
+        "vite",
+        "tasselli",
+        "tassello",
+        "bulloni",
+        "bullone",
+        "legno",
+        "truciolare",
+        "filetto",
+        "fischer",
+        "utensile",
+        "utensili",
+        "trapano",
+        "avvitatore",
+        "ricambio",
+        "ricambi",
+    ),
+    "ufficio": (
+        "cancelleria",
+        "prodotti per ufficio",
+        "ufficio",
+        "inchiostro",
+        "pennarello",
+        "pennarelli",
+        "marcatore",
+        "marcatori",
+        "evidenziatore",
+        "evidenziatori",
+        "matita",
+        "matite",
+        "penna",
+        "penne",
+        "scrittura",
+        "cartucce",
+        "toner",
+        "stampante",
     ),
     "alimentari": (
         "caffe",
-        "caff",
+        "caffè",
         "pasta",
         "vino",
         "olio",
         "cioccolato",
+        "cioccolata",
+        "kinder",
+        "nutella",
+        "biscotti",
+        "tonno",
+        "riso",
+        "salsa",
+        "sugo",
+        "the",
+        "tisana",
         "snack",
         "alimentari",
         "food",
         "bevanda",
+        "birra",
+        "whisky",
+        "gin",
+        "acqua",
+        "succhi",
+        "patatine",
+        "caramelle",
+        "barrette",
+        "proteine",
+        "croccantini",
+        "cibo",
     ),
     "software": (
         "software",
         "vpn",
         "licenza",
         "windows",
-        "office",
+        "microsoft office",
+        "office 365",
         "antivirus",
         "abbonamento",
-        "app",
+        "app mobile",
+        "applicazione",
+        "applicazioni",
+        "steam",
+        "playstation plus",
+        "xbox game pass",
+        "gift card",
+        "codice digitale",
+        "cloud storage",
+    ),
+}
+
+BOOK_GENRE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "libri/fantasy": (
+        "fantasy",
+        "urban fantasy",
+        "fantascienza",
+        "sci fi",
+        "science fiction",
+        "distopia",
+    ),
+    "libri/thriller": (
+        "thriller",
+        "giallo",
+        "gialli",
+        "crime",
+        "noir",
+        "mistero",
+        "suspense",
+        "poliziesco",
+    ),
+    "libri/romanzi": (
+        "romanzo",
+        "romanzi",
+        "narrativa",
+        "letteratura",
+        "rosa",
+        "romance",
+        "contemporanea",
+    ),
+    "libri/bambini": (
+        "bambini",
+        "ragazzi",
+        "young adult",
+        "infanzia",
+        "adolescenti",
+    ),
+    "libri/fumetti": (
+        "fumetto",
+        "fumetti",
+        "manga",
+        "graphic novel",
+        "comics",
+    ),
+    "libri/manuali": (
+        "manuale",
+        "manuali",
+        "business",
+        "economia",
+        "informatica",
+        "programmazione",
+        "cucina",
+        "self-help",
+        "crescita personale",
+    ),
+}
+
+SITE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "elettronica": (
+        "elettronica",
+        "informatica",
+        "telefonia",
+        "cellulari",
+        "computer",
+        "audio",
+        "video",
+        "tv e home cinema",
+        "accessori per cellulari",
+    ),
+    "accessori": (
+        "custodie",
+        "cover",
+        "borse per fotocamera",
+        "borse per laptop",
+        "borse per notebook",
+        "supporti tv",
+        "supporti da parete",
+        "staffa tv",
+        "accessori per tablet",
+    ),
+    "casa": (
+        "casa e cucina",
+        "casa",
+        "cucina",
+        "giardino",
+        "illuminazione",
+        "arredamento",
+        "elettrodomestici",
+    ),
+    "moda": (
+        "abbigliamento",
+        "scarpe",
+        "borse",
+        "gioielli",
+        "orologi",
+        "moda",
+    ),
+    "bellezza": (
+        "bellezza",
+        "salute",
+        "cura della persona",
+        "profumi",
+        "cosmetici",
+        "igiene",
+    ),
+    "sport": (
+        "sport",
+        "tempo libero",
+        "outdoor",
+        "fitness",
+        "palestra",
+    ),
+    "giochi": (
+        "giochi e giocattoli",
+        "giocattoli",
+        "videogiochi",
+        "hobby",
+    ),
+    "infanzia": (
+        "prima infanzia",
+        "neonati",
+        "pannolini",
+        "seggiolini auto",
+        "seggioloni",
+        "passeggini",
+        "fasciatoi",
+    ),
+    "libri": (
+        "libri",
+        "book",
+        "books",
+        "kindle store",
+        "audible",
+        "letteratura",
+        "narrativa",
+    ),
+    "auto": (
+        "auto e moto",
+        "automotive",
+        "accessori auto",
+        "ricambi",
+        "moto",
+    ),
+    "viaggi": (
+        "valigeria",
+        "bagagli",
+        "accessori da viaggio",
+        "zaini e borse da viaggio",
+        "trolley",
+        "lucchetti per bagagli",
+    ),
+    "fai-da-te": (
+        "fai da te",
+        "bricolage",
+        "ferramenta",
+        "utensili",
+        "utensili elettrici",
+        "viti",
+        "bulloni",
+        "tasselli",
+    ),
+    "ufficio": (
+        "cancelleria",
+        "prodotti per ufficio",
+        "penne",
+        "matite",
+        "scrittura",
+        "marcatori",
+        "evidenziatori",
+        "inchiostro",
+        "toner",
+    ),
+    "alimentari": (
+        "alimentari",
+        "supermercato",
+        "food",
+        "bevande",
+        "drogheria",
+    ),
+    "software": (
+        "software",
+        "applicazioni",
+        "licenze",
+        "antivirus",
+        "download digitale",
     ),
 }
 
@@ -257,16 +781,114 @@ def extract_price_pair(text: str) -> tuple[Decimal | None, Decimal | None]:
     return max(unique_prices), min(unique_prices)
 
 
-def classify_category(text: str) -> str:
-    normalized = text.lower()
+def known_filter_categories() -> tuple[str, ...]:
+    return tuple(sorted({*CATEGORY_KEYWORDS.keys(), *BOOK_GENRE_KEYWORDS.keys()}))
+
+
+@lru_cache(maxsize=4096)
+def keyword_pattern(keyword: str) -> re.Pattern[str]:
+    word_chars = "a-z0-9àèéìòùáíóúü"
+    return re.compile(
+        rf"(?<![{word_chars}]){re.escape(keyword.lower())}(?![{word_chars}])",
+        flags=re.IGNORECASE,
+    )
+
+
+def keyword_score(text: str, keywords: tuple[str, ...]) -> int:
+    return sum(1 for keyword in keywords if keyword_pattern(keyword).search(text))
+
+
+def best_keyword_category(
+    text: str,
+    keyword_map: dict[str, tuple[str, ...]],
+) -> tuple[str, int]:
     best_category = "altro"
     best_score = 0
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        score = sum(1 for keyword in keywords if keyword in normalized)
+    for category, keywords in keyword_map.items():
+        score = keyword_score(text, keywords)
         if score > best_score:
             best_category = category
             best_score = score
-    return best_category
+    return best_category, best_score
+
+
+def classify_book_genre(site_text: str, product_text: str) -> str | None:
+    site_category, site_score = best_keyword_category(site_text, BOOK_GENRE_KEYWORDS)
+    if site_score:
+        return site_category
+    product_category, product_score = best_keyword_category(product_text, BOOK_GENRE_KEYWORDS)
+    if product_score >= 2:
+        return product_category
+    return None
+
+
+def render_category(category: str, site_text: str, product_text: str) -> str:
+    if category == "libri":
+        return classify_book_genre(site_text, product_text) or "libri"
+    return category
+
+
+def product_category_should_override_site(
+    site_category: str,
+    site_score: int,
+    product_category: str,
+    product_score: int,
+) -> bool:
+    if not product_score or not site_score:
+        return False
+    if product_category == site_category:
+        return False
+    if product_category == "libri" and product_score >= site_score:
+        return True
+    misleading_site_categories = {
+        "giochi": {"moda", "infanzia", "casa", "auto", "viaggi"},
+        "elettronica": {
+            "accessori",
+            "giochi",
+            "moda",
+            "infanzia",
+            "casa",
+            "auto",
+            "viaggi",
+            "fai-da-te",
+            "ufficio",
+            "libri",
+        },
+    }
+    return product_category in misleading_site_categories.get(site_category, set())
+
+
+def classify_category(text: str, site_text: str = "") -> str:
+    normalized_text = text.lower()
+    normalized_site = site_text.lower()
+
+    site_category, site_score = best_keyword_category(normalized_site, SITE_CATEGORY_KEYWORDS)
+    product_category, product_score = best_keyword_category(normalized_text, CATEGORY_KEYWORDS)
+    if product_category_should_override_site(site_category, site_score, product_category, product_score):
+        return render_category(product_category, normalized_site, normalized_text)
+    if site_category == "libri" and site_score:
+        return render_category("libri", normalized_site, normalized_text)
+    if site_score:
+        return site_category
+
+    if product_score:
+        return render_category(product_category, normalized_site, normalized_text)
+    return fallback_category(normalized_text, normalized_site)
+
+
+def fallback_category(text: str, site_text: str = "") -> str:
+    combined = f"{site_text} {text}".strip()
+    if not combined:
+        return "casa"
+    if re.search(r"\b(?:w|mah|usb|hdmi|hz|gb|tb|bluetooth|wifi|wi fi|led|4k|5g)\b", combined):
+        return "elettronica"
+    if re.search(r"\b(?:ml|litri|kg|gr|gusto|ingredienti|senza zucchero|proteine)\b", combined):
+        return "alimentari"
+    if re.search(r"\b(?:cm|cotone|polipropilene|acciaio|legno|ceramica|vetro|bagno|camera|filtro|filtri)\b", combined):
+        return "casa"
+    if re.search(r"\b(?:uomo|donna|unisex|taglia|vestibilita|calzata)\b", combined):
+        return "moda"
+    return "casa"
 
 
 def is_invalid_offer(text: str) -> bool:
@@ -279,14 +901,27 @@ def is_offer_url(url: str) -> bool:
         return False
     if lowered.startswith("tg:"):
         return False
+    if any(host in lowered for host in MEDIA_URL_HOSTS):
+        return False
+    if lowered.split("?", 1)[0].endswith(MEDIA_URL_EXTENSIONS):
+        return False
     return lowered.startswith("http://") or lowered.startswith("https://")
+
+
+def offer_url_priority(url: str) -> int:
+    lowered = url.lower()
+    if "amazon." in lowered and "/dp/" in canonicalize_url(url):
+        return 0
+    if any(host in lowered for host in ("amzlink.to", "amzn.to", "ofclub.click")):
+        return 1
+    return 2
 
 
 def pick_offer_url(text: str, urls: tuple[str, ...] = ()) -> str | None:
     candidates = [*urls, *extract_urls(text)]
-    for url in candidates:
-        if is_offer_url(url):
-            return canonicalize_url(url)
+    offer_urls = [url for url in candidates if is_offer_url(url)]
+    for url in sorted(offer_urls, key=offer_url_priority):
+        return canonicalize_url(url)
     return None
 
 
@@ -331,10 +966,10 @@ def extract_product(text: str) -> str | None:
     return best_line[:140].strip(" -:,.") or None
 
 
-def analyze_offer(text: str, urls: tuple[str, ...] = ()) -> OfferFacts:
+def analyze_offer(text: str, urls: tuple[str, ...] = (), site_text: str = "") -> OfferFacts:
     original_price, current_price = extract_price_pair(text)
     return OfferFacts(
-        category=classify_category(text),
+        category=classify_category(text, site_text),
         price=current_price,
         invalid=is_invalid_offer(text),
         product=extract_product(text),

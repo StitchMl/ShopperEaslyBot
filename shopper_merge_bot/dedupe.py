@@ -80,7 +80,7 @@ class DedupeStore:
                 primary_message_id INTEGER NOT NULL,
                 extra_message_ids TEXT NOT NULL DEFAULT '',
                 text TEXT NOT NULL,
-                category TEXT NOT NULL DEFAULT 'altro',
+                category TEXT NOT NULL DEFAULT 'casa',
                 price TEXT,
                 source_count INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'active',
@@ -344,6 +344,61 @@ class DedupeStore:
             ),
         )
 
+    def rename_offer_fingerprint(self, old_fingerprint: str, new_fingerprint: str) -> bool:
+        try:
+            self._conn.execute("BEGIN")
+            self._conn.execute(
+                "UPDATE offers SET fingerprint = ?, updated_at = ? WHERE fingerprint = ?",
+                (new_fingerprint, int(time.time()), old_fingerprint),
+            )
+            self._conn.execute(
+                "UPDATE offer_sources SET fingerprint = ? WHERE fingerprint = ?",
+                (new_fingerprint, old_fingerprint),
+            )
+            self._conn.execute("COMMIT")
+            return True
+        except sqlite3.IntegrityError:
+            self._conn.execute("ROLLBACK")
+            return False
+
+    def merge_offer_into(self, source_fingerprint: str, target_fingerprint: str) -> int:
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO offer_sources(
+                fingerprint,
+                source_chat_id,
+                source_message_id,
+                source_title,
+                source_link,
+                added_at
+            )
+            SELECT
+                ?,
+                source_chat_id,
+                source_message_id,
+                source_title,
+                source_link,
+                added_at
+            FROM offer_sources
+            WHERE fingerprint = ?
+            """,
+            (target_fingerprint, source_fingerprint),
+        )
+        source_count = self._conn.execute(
+            "SELECT COUNT(*) FROM offer_sources WHERE fingerprint = ?",
+            (target_fingerprint,),
+        ).fetchone()[0]
+        self._conn.execute(
+            """
+            UPDATE offers
+            SET source_count = ?, updated_at = ?
+            WHERE fingerprint = ?
+            """,
+            (int(source_count), int(time.time()), target_fingerprint),
+        )
+        self.mark_offer_status(source_fingerprint, "deleted:merged-duplicate")
+        return int(source_count)
+
     def mark_offer_status(self, fingerprint: str, status: str) -> None:
         self._conn.execute(
             """
@@ -352,6 +407,16 @@ class DedupeStore:
             WHERE fingerprint = ?
             """,
             (status, int(time.time()), fingerprint),
+        )
+
+    def update_offer_category(self, fingerprint: str, category: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE offers
+            SET category = ?, updated_at = ?
+            WHERE fingerprint = ?
+            """,
+            (category, int(time.time()), fingerprint),
         )
 
     def add_offer_source(

@@ -54,3 +54,53 @@ class DedupeStoreTest(unittest.TestCase):
                 self.assertEqual(offer.text, "new")
             finally:
                 store.close()
+
+    def test_rename_and_merge_offer_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = DedupeStore(Path(temp_dir) / "shopper.sqlite3")
+            try:
+                store.save_offer(
+                    fingerprint="short-a",
+                    destination_chat_id="dest",
+                    primary_message_id=10,
+                    extra_message_ids=(),
+                    text="a",
+                    category="altro",
+                    price=Decimal("4.99"),
+                )
+                store.add_offer_source(
+                    fingerprint="short-a",
+                    source_chat_id="source-a",
+                    source_message_id=1,
+                    source_title="A",
+                    source_link="",
+                )
+                store.save_offer(
+                    fingerprint="short-b",
+                    destination_chat_id="dest",
+                    primary_message_id=11,
+                    extra_message_ids=(),
+                    text="b",
+                    category="altro",
+                    price=Decimal("4.99"),
+                )
+                store.add_offer_source(
+                    fingerprint="short-b",
+                    source_chat_id="source-b",
+                    source_message_id=2,
+                    source_title="B",
+                    source_link="",
+                )
+
+                self.assertTrue(store.rename_offer_fingerprint("short-a", "canonical"))
+                source_count = store.merge_offer_into("short-b", "canonical")
+
+                self.assertEqual(source_count, 2)
+                self.assertEqual(store.get_offer("canonical").status, "active")  # type: ignore[union-attr]
+                self.assertEqual(
+                    store.get_offer("short-b").status,  # type: ignore[union-attr]
+                    "deleted:merged-duplicate",
+                )
+                self.assertEqual(len(store.offer_sources("canonical")), 2)
+            finally:
+                store.close()

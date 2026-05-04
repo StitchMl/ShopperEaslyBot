@@ -5,6 +5,7 @@ from shopper_merge_bot.normalization import (
     canonicalize_url,
     extract_urls,
     normalize_text,
+    should_resolve_redirect,
 )
 
 
@@ -39,3 +40,8 @@ class NormalizationTest(unittest.TestCase):
         )
         self.assertEqual(first, "https://amazon.it/dp/B0ABCDEF12")
         self.assertEqual(first, second)
+
+    def test_amazon_shortener_should_be_resolved(self) -> None:
+        self.assertTrue(should_resolve_redirect("https://amzlink.to/example"))
+        self.assertTrue(should_resolve_redirect("https://amzn.to/example"))
+        self.assertFalse(should_resolve_redirect("https://amazon.it/dp/B0ABCDEF12"))
