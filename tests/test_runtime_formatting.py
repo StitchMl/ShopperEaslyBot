@@ -17,6 +17,7 @@ from shopper_merge_bot.runtime import (
     edit_offer_media_as_gif,
     edit_offer_message,
     fingerprint_for_offer_url,
+    mark_menu_group_seen,
     menu_group_summaries,
     passes_filters,
     preferred_source_id,
@@ -152,7 +153,11 @@ class RuntimeFormattingTest(unittest.TestCase):
                 self.assertIn("Offerte attive: 1", index)
                 self.assertIn("NUOVE 24h: 1", index)
                 summaries = menu_group_summaries(store)
+                self.assertIn(("elettronica:cuffie", "elettronica / Cuffie", 1, 1), summaries)
                 self.assertIn(("software:all", "software / Software", 0, 0), summaries)
+                mark_menu_group_seen(store, "elettronica:cuffie")
+                summaries = menu_group_summaries(store)
+                self.assertIn(("elettronica:cuffie", "elettronica / Cuffie", 1, 0), summaries)
                 empty_detail = render_offer_menu_detail_text(store, "software:all", [], 0, 3500)
                 self.assertIn("Shopper Easly - software / Software", empty_detail)
                 self.assertIn("Offerte attive: 0 | NUOVE 24h: 0", empty_detail)
@@ -172,6 +177,10 @@ class RuntimeFormattingTest(unittest.TestCase):
         self.assertEqual(
             parse_menu_callback_data(b"menu:open:elettronica:cuffie:2"),
             ("open", "elettronica:cuffie", 2),
+        )
+        self.assertEqual(
+            parse_menu_callback_data(b"menu:close:elettronica:cuffie:0"),
+            ("close", "elettronica:cuffie", 0),
         )
         self.assertEqual(parse_menu_callback_data(b"menu:close"), ("close", "", 0))
 

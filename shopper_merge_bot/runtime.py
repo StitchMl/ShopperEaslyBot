@@ -51,6 +51,8 @@ MENU_NEW_WINDOW_SECONDS = 24 * 60 * 60
 MENU_MAX_OFFERS = 25
 MENU_DETAIL_PAGE_SIZE = 10
 MENU_INDEX_KEY = "menu:index"
+MENU_OPEN_PREFIX = "menu:open:"
+MENU_SEEN_PREFIX = "menu_seen:"
 PRODUCT_GIF_FRAME_DURATION_MS = 1200
 PRODUCT_GIF_MAX_FRAMES = 12
 PRODUCT_GIF_MAX_SIDE = 900
@@ -647,6 +649,38 @@ def selected_menu_categories(store: DedupeStore) -> tuple[str, ...]:
     return tuple(categories)
 
 
+def menu_seen_config_key(menu_key: str) -> str:
+    return f"{MENU_SEEN_PREFIX}{menu_key}"
+
+
+def menu_group_seen_at(store: DedupeStore, menu_key: str) -> int:
+    value = store.get_config(menu_seen_config_key(menu_key)) or ""
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 0
+
+
+def mark_menu_group_seen(store: DedupeStore, menu_key: str, seen_at: int | None = None) -> None:
+    store.set_config(menu_seen_config_key(menu_key), str(seen_at or int(time.time())))
+
+
+def menu_group_new_count(
+    store: DedupeStore,
+    menu_key: str,
+    offers: Iterable[OfferRecord],
+    now: int | None = None,
+) -> int:
+    current_time = now or int(time.time())
+    seen_at = menu_group_seen_at(store, menu_key)
+    new_count = 0
+    for offer in offers:
+        latest_at = store.offer_latest_source_at(offer.fingerprint)
+        if latest_at > seen_at and latest_at >= current_time - MENU_NEW_WINDOW_SECONDS:
+            new_count += 1
+    return new_count
+
+
 def render_menu_offer_line(store: DedupeStore, index: int, offer: OfferRecord, now: int) -> list[str]:
     latest_at = store.offer_latest_source_at(offer.fingerprint)
     is_new = latest_at >= now - MENU_NEW_WINDOW_SECONDS
@@ -670,11 +704,7 @@ def render_offer_menu_text(
 ) -> str:
     now = int(time.time())
     title = menu_title_for_key(menu_key, offers)
-    new_count = sum(
-        1
-        for offer in offers
-        if store.offer_latest_source_at(offer.fingerprint) >= now - MENU_NEW_WINDOW_SECONDS
-    )
+    new_count = menu_group_new_count(store, menu_key, offers, now)
     updated_at = datetime.fromtimestamp(now).strftime("%d/%m/%Y %H:%M")
     lines = [
         f"Shopper Easly - {title}",
@@ -697,11 +727,7 @@ def menu_group_summaries(store: DedupeStore) -> list[tuple[str, str, int, int]]:
     groups = grouped_active_offers(store)
     for menu_key, offers in groups.items():
         title = menu_title_for_key(menu_key, offers)
-        new_count = sum(
-            1
-            for offer in offers
-            if store.offer_latest_source_at(offer.fingerprint) >= now - MENU_NEW_WINDOW_SECONDS
-        )
+        new_count = menu_group_new_count(store, menu_key, offers, now)
         summaries.append((menu_key, title, len(offers), new_count))
     covered_categories = {menu_key_parts(menu_key)[0] for menu_key in groups}
     for category in selected_menu_categories(store):
@@ -753,8 +779,11 @@ def parse_menu_callback_data(data: bytes) -> tuple[str, str, int] | None:
         return None
     action = parts[1]
     if action == "close":
-        return action, "", 0
-    if action != "open" or len(parts) != 5:
+        if len(parts) == 2:
+            return action, "", 0
+        if len(parts) != 5:
+            return None
+    elif action != "open" or len(parts) != 5:
         return None
     try:
         page = max(0, int(parts[4]))
@@ -780,11 +809,7 @@ def render_offer_menu_detail_text(
 ) -> str:
     title = menu_title_for_key(menu_key, offers)
     now = int(time.time())
-    new_count = sum(
-        1
-        for offer in offers
-        if store.offer_latest_source_at(offer.fingerprint) >= now - MENU_NEW_WINDOW_SECONDS
-    )
+    new_count = menu_group_new_count(store, menu_key, offers, now)
     if not offers:
         lines = [
             f"Shopper Easly - {title}",
@@ -822,6 +847,14 @@ def menu_detail_buttons(menu_key: str, page: int, offer_count: int) -> list[list
         rows.append(nav)
     rows.append([Button.inline("Chiudi", b"menu:close")])
     return rows
+
+
+def open_menu_storage_key(menu_key: str) -> str:
+    return f"{MENU_OPEN_PREFIX}{menu_key}"
+
+
+def menu_expansion_close_buttons(menu_key: str) -> list[list[Button]]:
+    return [[Button.inline("Chiudi", menu_callback_data("close", menu_key, 0))]]
 
 
 def stable_offer_body(*, product: str, original_price: object, current_price: object, offer_url: str) -> str:
@@ -1612,10 +1645,210 @@ async def delete_offer_menu(
     if menu is None:
         return True
     ids = [menu.message_id, *menu.extra_message_ids]
-    deleted = await delete_messages_with_fallback(senders, destination, ids)
+    deleted = True
+    for start in range(0, len(ids), 100):
+        chunk = ids[start : start + 100]
+        if not await delete_messages_with_fallback(senders, destination, chunk):
+            deleted = False
     if deleted:
         store.delete_menu_message(menu_key)
     return deleted
+
+
+async def delete_open_menu_expansions(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object,
+    store: DedupeStore,
+    except_menu_key: str | None = None,
+) -> tuple[int, int]:
+    deleted = 0
+    failed = 0
+    except_storage_key = open_menu_storage_key(except_menu_key) if except_menu_key else ""
+    for menu in store.list_menu_messages():
+        if not menu.menu_key.startswith(MENU_OPEN_PREFIX):
+            continue
+        if except_storage_key and menu.menu_key == except_storage_key:
+            continue
+        if await delete_offer_menu(
+            senders=senders,
+            destination=destination,
+            store=store,
+            menu_key=menu.menu_key,
+        ):
+            deleted += 1
+        else:
+            failed += 1
+    return deleted, failed
+
+
+def build_offer_detail_text(store: DedupeStore, offer: OfferRecord, max_chars: int) -> str:
+    return build_offer_publish_text_from_body(
+        body=offer.text,
+        category=offer.category,
+        sources=store.offer_sources(offer.fingerprint),
+        max_chars=max_chars,
+    )
+
+
+async def collect_offer_media_paths(
+    *,
+    source_reader: TelegramClient,
+    store: DedupeStore,
+    offer: OfferRecord,
+    directory: Path,
+) -> list[Path]:
+    media_paths: list[Path] = []
+    seen_source_messages: set[tuple[str, int]] = set()
+    for source in store.offer_source_messages(offer.fingerprint):
+        source_key = (source.source_chat_id, source.source_message_id)
+        if source_key in seen_source_messages:
+            continue
+        seen_source_messages.add(source_key)
+        source_message = await get_source_message(source_reader, source)
+        if source_message is None or not getattr(source_message, "media", None):
+            continue
+        source_dir = directory / f"source-{len(media_paths)}"
+        source_dir.mkdir()
+        source_media = await download_message_media(source_message, source_dir)
+        if source_media is not None:
+            media_paths.append(source_media)
+    return media_paths
+
+
+async def send_offer_detail_message(
+    *,
+    sender: TelegramClient,
+    source_reader: TelegramClient,
+    destination: object,
+    store: DedupeStore,
+    offer: OfferRecord,
+    max_chars: int,
+) -> list[int]:
+    text = build_offer_detail_text(store, offer, max_chars)
+    with tempfile.TemporaryDirectory(prefix="shopperbot-menu-offer-") as temp_dir:
+        temp_path = Path(temp_dir)
+        media_paths = await collect_offer_media_paths(
+            source_reader=source_reader,
+            store=store,
+            offer=offer,
+            directory=temp_path,
+        )
+        media_path: Path | None = None
+        gif_path = temp_path / "product-images.gif"
+        if create_product_gif(media_paths, gif_path):
+            media_path = gif_path
+        elif media_paths:
+            media_path = media_paths[0]
+
+        if media_path is not None:
+            try:
+                result = await asyncio.wait_for(
+                    sender.send_file(
+                        destination,
+                        file=media_path,
+                        caption=trim_text(text, CAPTION_LIMIT),
+                        parse_mode=None,
+                    ),
+                    timeout=PRODUCT_GIF_UPLOAD_TIMEOUT_SECONDS,
+                )
+                message_ids = _message_ids_from_result(result)
+                if message_ids:
+                    return message_ids
+            except Exception as exc:
+                LOGGER.warning("Could not send menu offer %s with media: %s", offer.fingerprint, exc)
+
+    result = await sender.send_message(
+        destination,
+        text,
+        link_preview=True,
+        parse_mode=None,
+    )
+    return _message_ids_from_result(result)
+
+
+async def expand_offer_menu(
+    *,
+    senders: Iterable[TelegramClient],
+    source_reader: TelegramClient,
+    destination: object,
+    store: DedupeStore,
+    menu_key: str,
+    offers: list[OfferRecord],
+    max_chars: int,
+    pause_seconds: float,
+) -> tuple[int, int]:
+    await delete_open_menu_expansions(
+        senders=senders,
+        destination=destination,
+        store=store,
+    )
+
+    senders_tuple = tuple(senders)
+    sender = senders_tuple[0] if senders_tuple else None
+    if sender is None:
+        return 0, 1
+
+    title = menu_title_for_key(menu_key, offers)
+    sent_ids: list[int] = []
+    sent_offers = 0
+    failed = 0
+    if offers:
+        for offer in offers:
+            try:
+                message_ids = await send_offer_detail_message(
+                    sender=sender,
+                    source_reader=source_reader,
+                    destination=destination,
+                    store=store,
+                    offer=offer,
+                    max_chars=max_chars,
+                )
+                if message_ids:
+                    sent_ids.extend(message_ids)
+                    sent_offers += 1
+                else:
+                    failed += 1
+            except Exception as exc:
+                LOGGER.warning("Could not expand menu offer %s: %s", offer.fingerprint, exc)
+                failed += 1
+            if pause_seconds > 0:
+                await asyncio.sleep(pause_seconds)
+
+    if offers:
+        control_text = "\n".join(
+            [
+                f"Shopper Easly - {title}",
+                f"Prodotti mostrati: {sent_offers}",
+            ]
+        )
+    else:
+        control_text = render_offer_menu_detail_text(store, menu_key, offers, 0, max_chars)
+
+    try:
+        control_ids = await send_menu_message(
+            sender,
+            destination,
+            control_text,
+            buttons=menu_expansion_close_buttons(menu_key),
+        )
+    except Exception as exc:
+        LOGGER.warning("Could not send menu expansion close control for %s: %s", menu_key, exc)
+        return sent_offers, failed + 1
+
+    if control_ids:
+        store.save_menu_message(
+            menu_key=open_menu_storage_key(menu_key),
+            message_id=control_ids[0],
+            extra_message_ids=tuple([*sent_ids, *control_ids[1:]]),
+            title=title,
+        )
+    seen_at = max(
+        (store.offer_latest_source_at(offer.fingerprint) for offer in offers),
+        default=int(time.time()),
+    )
+    mark_menu_group_seen(store, menu_key, seen_at)
+    return sent_offers, failed
 
 
 async def sync_offer_menus(
@@ -3426,41 +3659,52 @@ async def register_control_bot(
         action, menu_key, page = parsed
         if action == "close":
             if state.destination is not None:
-                await delete_messages_with_fallback(
-                    cleanup_senders,
-                    state.destination,
-                    [int(event.message_id)],
-                )
+                deleted = False
+                if menu_key:
+                    deleted = await delete_offer_menu(
+                        senders=cleanup_senders,
+                        destination=state.destination,
+                        store=store,
+                        menu_key=open_menu_storage_key(menu_key),
+                    )
+                if not deleted:
+                    await delete_messages_with_fallback(
+                        cleanup_senders,
+                        state.destination,
+                        [int(event.message_id)],
+                    )
             else:
                 await event.delete()
             await event.answer("Chiuso.")
             return
 
         offers = grouped_active_offers(store).get(menu_key, [])
-        text = render_offer_menu_detail_text(
-            store,
-            menu_key,
-            offers,
-            page,
-            settings.max_text_chars,
+        if state.destination is None:
+            await event.answer("Destinazione non configurata.", alert=True)
+            return
+
+        await event.answer("Apro categoria...")
+        source_reader = await first_user_client(cleanup_senders) or source_client
+        _sent, _failed = await expand_offer_menu(
+            senders=cleanup_senders,
+            source_reader=source_reader,
+            destination=state.destination,
+            store=store,
+            menu_key=menu_key,
+            offers=offers,
+            max_chars=settings.max_text_chars,
+            pause_seconds=settings.min_post_interval_seconds,
         )
-        buttons = menu_detail_buttons(menu_key, page, len(offers))
-        index_message = store.get_menu_message(MENU_INDEX_KEY)
-        if index_message is not None and int(event.message_id) == index_message.message_id:
+        await upsert_menu_index(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+        )
+        if _failed:
             await event.respond(
-                text,
-                buttons=buttons,
+                f"Categoria aperta, ma {_failed} prodotti non sono stati inviati.",
                 parse_mode=None,
-                link_preview=False,
             )
-        else:
-            await event.edit(
-                text,
-                buttons=buttons,
-                parse_mode=None,
-                link_preview=False,
-            )
-        await event.answer()
 
     @bot.on(events.NewMessage(pattern=r"^/(start|help)(?:@\w+)?(?:\s|$)"))
     async def on_help(event: events.NewMessage.Event) -> None:
