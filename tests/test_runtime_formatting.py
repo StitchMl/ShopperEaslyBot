@@ -31,6 +31,7 @@ from shopper_merge_bot.runtime import (
     resolve_offer_urls,
     stable_offer_body,
     offer_menu_key,
+    offer_menu_type,
     parse_menu_callback_data,
 )
 
@@ -183,6 +184,37 @@ class RuntimeFormattingTest(unittest.TestCase):
             ("close", "elettronica:cuffie", 0),
         )
         self.assertEqual(parse_menu_callback_data(b"menu:close"), ("close", "", 0))
+
+    def test_offer_menu_type_uses_best_specific_group(self) -> None:
+        cases = (
+            ("Baseus EnerGeek Powerbank W mAh Compatible with MacBook Pro", "elettronica", ("accessori-tech", "Accessori tech")),
+            ("TP-Link Archer T3U Plus Chiavetta WiFi AC1300Mbps Antenna WiFi Usb per PC", "elettronica", ("rete-wifi", "Rete e Wi-Fi")),
+            ("CORSAIR NAUTILUS RS LCD Dissipatore a Liquido per CPU", "elettronica", ("componenti-pc", "Componenti PC")),
+            ("Canon Zoemini Stampante Fotografica Portatile Compatta Bluetooth", "elettronica", ("stampanti", "Stampanti")),
+            ("Tapo C K Telecamera WiFi Interno Rilevazione Smart AI", "elettronica", ("smart-home", "Smart home e sicurezza")),
+            ("Stanley Chiave regolabile MaxSteel x mm", "fai-da-te", ("utensili", "Utensili")),
+            ("Forgefix Vite e dado di fissaggio placcato zinco", "fai-da-te", ("ferramenta", "Ferramenta")),
+            ("Vimar P Avvolgicavo metri con prese universali Sicury", "fai-da-te", ("elettrico", "Materiale elettrico")),
+        )
+        for product, category, expected in cases:
+            with self.subTest(product=product):
+                offer = OfferRecord(
+                    fingerprint=product,
+                    destination_chat_id="dest",
+                    primary_message_id=0,
+                    extra_message_ids=(),
+                    text=stable_offer_body(
+                        product=product,
+                        original_price=Decimal("20"),
+                        current_price=Decimal("10"),
+                        offer_url="https://amazon.it/dp/B0TESTMENU1",
+                    ),
+                    category=category,
+                    price=Decimal("10"),
+                    source_count=1,
+                    status="active",
+                )
+                self.assertEqual(offer_menu_type(offer), expected)
 
 
 class RuntimeFilterTest(unittest.TestCase):

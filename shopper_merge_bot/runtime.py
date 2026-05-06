@@ -528,21 +528,32 @@ def build_offer_publish_text_from_body(
 MENU_TYPE_RULES: tuple[tuple[tuple[str, ...], str, str, tuple[str, ...]], ...] = (
     (("elettronica",), "cuffie", "Cuffie", ("cuffie", "auricolari", "headphones", "earbuds", "quietcomfort")),
     (("elettronica",), "casse", "Casse e speaker", ("speaker", "cassa", "casse", "altoparlante", "soundbar", "xboom", "jbl")),
+    (("elettronica",), "accessori-tech", "Accessori tech", ("caricatore", "powerbank", "cavo usb", "usb-c", "magsafe", "mouse", "tastiera", "adattatore usb")),
+    (("elettronica",), "rete-wifi", "Rete e Wi-Fi", ("router", "wifi", "wi-fi", "saponetta wifi", "hotspot", "tp-link", "tplink", "antenna wifi", "archer")),
+    (("elettronica",), "componenti-pc", "Componenti PC", ("dissipatore", "cpu", "scheda madre", "ram", "corsair", "nautilus")),
+    (("elettronica",), "stampanti", "Stampanti", ("stampante", "stampanti", "cartuccia", "cartucce", "zoemini", "laserjet", "deskjet")),
+    (("elettronica",), "smart-home", "Smart home e sicurezza", ("tapo", "telecamera wifi", "telecamera", "camera wifi", "videosorveglianza")),
     (("elettronica",), "computer", "Computer", ("notebook", "laptop", "computer", "mini pc", "desktop", "macbook", "pavilion", "elitebook")),
     (("elettronica",), "monitor", "Monitor", ("monitor", "fullhd", "full hd", "qhd", "uhd")),
     (("elettronica",), "smartphone", "Smartphone", ("smartphone", "telefono", "iphone", "samsung galaxy", "xiaomi", "redmi", "oneplus", "oppo", "realme")),
     (("elettronica",), "storage", "Storage", ("ssd", "hard disk", "hdd", "microsd", "micro sd", "scheda sd", "memory card", "sandisk")),
-    (("elettronica",), "tv-video", "TV e video", ("tv", "televisore", "proiettore", "projector", "videocamera", "fotocamera")),
+    (("elettronica",), "tv-video", "TV, foto e video", ("tv", "televisore", "proiettore", "projector", "videocamera", "fotocamera", "drone", "dji", "kodak")),
     (("elettronica",), "gaming", "Gaming", ("console", "playstation", "xbox", "nintendo", "gaming")),
-    (("elettronica",), "accessori-tech", "Accessori tech", ("caricatore", "powerbank", "cavo usb", "usb-c", "magsafe", "router", "mouse", "tastiera")),
     (("giochi",), "lego", "LEGO", ("lego",)),
     (("giochi",), "videogiochi", "Videogiochi", ("videogioco", "videogiochi", "nintendo", "super mario", "playstation", "xbox", "switch")),
     (("giochi",), "giochi-bambini", "Giochi bambini", ("giocattolo", "bambola", "bambole", "peluche", "playmobil", "hot wheels", "barbie", "gormi")),
     (("software",), "licenze", "Licenze e codici", ("licenza", "codice digitale", "gift card", "windows", "office", "antivirus")),
     (("software",), "abbonamenti", "Abbonamenti", ("abbonamento", "vpn", "cloud storage", "playstation plus", "xbox game pass")),
     (("casa",), "cucina", "Cucina", ("cucina", "friggitrice", "forno", "microonde", "pentola", "padella", "barbecue", "weber")),
+    (("casa",), "bagno", "Bagno", ("bagno", "porta carta igienica", "portarotolo", "doccia", "rubinetto")),
+    (("casa",), "arredo", "Arredo", ("scarpiera", "cornice", "mobile", "mensola", "tappeto", "cuscino", "zanzariera", "tenda")),
+    (("casa",), "illuminazione", "Illuminazione", ("lampada", "lampadine", "lampadina", "led", "illuminazione")),
     (("casa",), "pulizia", "Pulizia casa", ("aspirapolvere", "pulizia", "detersivo", "ammorbidente")),
-    (("fai-da-te",), "utensili", "Utensili", ("utensile", "trapano", "avvitatore", "paranco", "puleggia", "ribimex")),
+    (("fai-da-te",), "utensili", "Utensili", ("utensile", "trapano", "avvitatore", "paranco", "puleggia", "ribimex", "chiave regolabile", "seghetto", "smerigliatrice", "idropulitrice", "wolfcraft")),
+    (("fai-da-te",), "giardino", "Giardino", ("tagliaerba", "motosega", "catena di ricambio", "oregon", "greenworks")),
+    (("fai-da-te",), "elettrico", "Materiale elettrico", ("avvolgicavo", "spina", "presa multipla", "presa universale", "vimar", "electraline", "schuko")),
+    (("fai-da-te",), "ferramenta", "Ferramenta", ("vite", "viti", "tassello", "tasselli", "bullone", "bulloni", "forgefix", "fischer", "dado")),
+    (("fai-da-te",), "sicurezza", "Sicurezza lavoro", ("casco di sicurezza", "portwest", "lucchetto a chiave", "master lock")),
     (("bellezza",), "makeup", "Make-up", ("fondotinta", "makeup", "make up", "smalto", "rossetto", "mascara")),
     (("bellezza",), "cura-persona", "Cura persona", ("crema", "shampoo", "rasoio", "spazzolino", "deodorante", "profumo")),
     (("animali",), "gatti", "Gatti", ("gatto", "gatti", "lettiera", "inaba")),
@@ -599,11 +610,19 @@ def menu_slug_title(category: str, slug: str) -> str:
 def offer_menu_type(offer: OfferRecord) -> tuple[str, str]:
     category = menu_category(offer.category)
     haystack = normalize_text(f"{offer.category} {offer_record_product(offer) or ''} {offer.text}")
+    best_slug = ""
+    best_title = ""
+    best_score = 0
     for categories, slug, title, keywords in MENU_TYPE_RULES:
         if category not in categories:
             continue
-        if any(keyword_in_normalized_text(keyword, haystack) for keyword in keywords):
-            return slug, title
+        score = sum(1 for keyword in keywords if keyword_in_normalized_text(keyword, haystack))
+        if score > best_score:
+            best_slug = slug
+            best_title = title
+            best_score = score
+    if best_score:
+        return best_slug, best_title
     fallback_titles = {
         "elettronica": "Altra elettronica",
         "giochi": "Altri giochi",
@@ -2566,6 +2585,10 @@ async def recategorize_active_offers(
                 failed += 1
             continue
 
+        if is_menu_only_enabled(store):
+            updated += 1
+            continue
+
         rendered = build_offer_publish_text_from_body(
             body=refreshed.text,
             category=new_category,
@@ -4367,6 +4390,14 @@ async def register_control_bot(
             limit=limit,
             only_altro=only_altro,
         )
+        menu_updated = menu_deleted = menu_failed = 0
+        if is_menu_only_enabled(store):
+            menu_updated, menu_deleted, menu_failed = await sync_offer_menus(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                max_chars=settings.max_text_chars,
+            )
         await event.respond(
             "\n".join(
                 [
@@ -4374,7 +4405,9 @@ async def register_control_bot(
                     f"Offerte analizzate: {scanned}",
                     f"Messaggi aggiornati: {updated}",
                     f"Offerte rimosse dai filtri: {deleted}",
-                    f"Operazioni fallite: {failed}",
+                    f"Menu aggiornati: {menu_updated}",
+                    f"Menu rimossi: {menu_deleted}",
+                    f"Operazioni fallite: {failed + menu_failed}",
                 ]
             ),
             parse_mode=None,

@@ -199,6 +199,27 @@ class OfferAnalysisTest(unittest.TestCase):
             ),
             "casa",
         )
+        self.assertEqual(
+            classify_category(
+                "Ibergrif MK Porta Carta Igienica Adesivo Portarotolo Carta Igienica Acciaio Inox",
+                site_text="Fai da te > Bagno > Accessori bagno",
+            ),
+            "casa",
+        )
+        self.assertEqual(
+            classify_category(
+                "walther design Naturale x cm Vero Vetro Cornice in Legno di Stoccolma",
+                site_text="Fai da te > Cornici",
+            ),
+            "casa",
+        )
+        self.assertEqual(
+            classify_category(
+                "Sekey x cm Zanzariera Magnetica per Porta, anti Insetti",
+                site_text="Fai da te > Porte e finestre",
+            ),
+            "casa",
+        )
 
     def test_product_can_override_broad_site_category(self) -> None:
         self.assertEqual(

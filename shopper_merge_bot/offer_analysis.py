@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 
-from .normalization import canonicalize_url, extract_urls
+from .normalization import canonicalize_url, extract_urls, normalize_text
 
 
 PRICE_RE = re.compile(
@@ -58,6 +58,9 @@ GENERIC_PRODUCT_PATTERNS = (
     r"^segnalat[ao]\s+su\b",
     r"^segnalat[ao]\s+sull\b",
     r"^occasione\s+su\b",
+    r"^minimo\s+storico$",
+    r"^prices\s+updated\s+on\b",
+    r"^how\s+to\s+come\s+usare\s+i\s+coupon\b",
     r"^i\s+prezzi\s+possono\s+subire\s+variazioni\b",
     r"^disclaimer$",
     r"^ad\s+info$",
@@ -813,6 +816,110 @@ SITE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+HIGH_CONFIDENCE_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "software",
+        (
+            r"\b(?:licenza digitale|codice digitale|codice download|download digitale|steam key)\b",
+            r"\b(?:office 365|microsoft office|antivirus|vpn|xbox game pass|playstation plus)\b",
+            r"\bcodice ea app\b",
+        ),
+    ),
+    (
+        "elettronica",
+        (
+            r"\b(?:air tag|airtag|tracker wallet|localizzatore bluetooth)\b",
+            r"\b(?:instax|pellicola istantanea)\b",
+        ),
+    ),
+    (
+        "viaggi",
+        (
+            r"\b(?:valigia|valigie|trolley|bagaglio|bagagli|lucchetto tsa)\b",
+            r"\b(?:samsonite|zaino con ruote|zaino .{0,40} con ruote|cinghie di compressione)\b",
+        ),
+    ),
+    (
+        "accessori",
+        (
+            r"\b(?:cover|custodia|custodie|pellicola|vetro temperato)\b",
+            r"\b(?:borsa|zaino)\s+(?:per\s+)?(?:fotocamera|laptop|notebook|tablet|pc)\b",
+            r"\b(?:supporto|staffa)\s+(?:tv|televisore|monitor|parete)\b",
+            r"\b(?:otterbox|lowepro)\b",
+        ),
+    ),
+    (
+        "infanzia",
+        (
+            r"\b(?:pannolini|pannolino|traversine|teli cambio|telo cambio)\b",
+            r"\b(?:seggiolino|seggiolini|passeggino|fasciatoio|lettino|cybex|pallas|dodot|babylino)\b",
+        ),
+    ),
+    (
+        "animali",
+        (
+            r"\b(?:gatto|gatti|cane|cani|croccantini|lettiera|leccornia|inaba)\b",
+            r"\b(?:snack per gatti|snack per cani|filetto di tonno)\b",
+        ),
+    ),
+    (
+        "bellezza",
+        (
+            r"\b(?:fondotinta|mascara|rossetto|smalto|unghie|manicure|makeup|make up)\b",
+            r"\b(?:shampoo|crema|profumo|rasoio|acido ialuronico|incarnato)\b",
+            r"\b(?:l oreal|oreal|elvive|gillette|oral b|braun|remington)\b",
+        ),
+    ),
+    (
+        "musica",
+        (
+            r"\b(?:bacchette|drumsticks|vic firth|hickory|percussioni)\b",
+            r"\b(?:chitarra|pianoforte|accordatore)\b",
+        ),
+    ),
+    (
+        "giochi",
+        (
+            r"\b(?:lego|giocattolo|giocattoli|gormiti|super mario|videogioco|videogiochi)\b",
+            r"\b(?:pokemon|barbie|playmobil|hot wheels|bambola|bambole|peluche)\b",
+        ),
+    ),
+    (
+        "casa",
+        (
+            r"\b(?:barbecue|weber|friggitrice|aspirapolvere|detersivo|ammorbidente)\b",
+            r"\b(?:cappa|filtri cappa|lampadina|lampadine|lampada)\b",
+            r"\b(?:scarpiera|zanzariera|porta carta igienica|portarotolo)\b",
+            r"\b(?:cornice in legno|vero vetro cornice|cornice foto|cornice da)\b",
+            r"\b(?:materasso|lenzuola|cuscino|coperta|tappeto)\b",
+        ),
+    ),
+    (
+        "fai-da-te",
+        (
+            r"\b(?:trapano|avvitatore|paranco|puleggia|argano|smerigliatrice|idropulitrice)\b",
+            r"\b(?:vite|viti|tasselli|bulloni|fischer|forgefix|porta inserti|wolfcraft)\b",
+            r"\b(?:motosega|catena di ricambio|tagliaerba|seghetto|chiave regolabile)\b",
+            r"\b(?:avvolgicavo|spina schuko|presa multipla|vimar|electraline)\b",
+            r"\b(?:lucchetto a chiave|casco di sicurezza)\b",
+        ),
+    ),
+    (
+        "elettronica",
+        (
+            r"\b(?:smartphone|iphone|galaxy|tablet android|monitor|ssd|hard disk|microsd)\b",
+            r"\b(?:router|wi fi|wifi|bluetooth|cuffie|auricolari|soundbar|speaker|altoparlanti)\b",
+            r"\b(?:tv|televisore|fotocamera|telecamera|drone|proiettore|projector)\b",
+            r"\b(?:powerbank|caricatore|tastiera|keyboard|mouse|microfono|stampante)\b",
+            r"\b(?:smartwatch|monitoraggio .{0,30} sonno|monitoraggio .{0,30} salute)\b",
+            r"\b(?:dissipatore(?: .{0,30})? cpu|raffreddatore(?: .{0,30})? cpu|aio cpu cooler|alimentatore atx)\b",
+            r"\b(?:adattatore usb|antenna wifi|tapo|tp link|blink|stream deck|controller da studio)\b",
+            r"\b(?:cavo patch|cavo antenna|cavo telefonico|coassiale|ethernet|rj45|rj11|dolby|hdr|oled|qled|mini led)\b",
+            r"\b(?:batterie a moneta|batteria al litio|cr2032|ventole argb|argb)\b",
+        ),
+    ),
+)
+
 OFFER_SOURCE_KEYWORDS = (
     "offerte",
     "offerta",
@@ -985,13 +1092,44 @@ def product_category_should_override_site(
             "animali",
             "musica",
         },
+        "fai-da-te": {
+            "accessori",
+            "animali",
+            "bellezza",
+            "casa",
+            "elettronica",
+            "giochi",
+            "infanzia",
+            "moda",
+            "musica",
+            "viaggi",
+        },
+        "casa": {"accessori", "animali", "bellezza", "elettronica", "infanzia", "moda", "viaggi"},
+        "accessori": {"bellezza", "casa", "elettronica", "giochi", "infanzia", "moda", "viaggi"},
     }
-    return product_category in misleading_site_categories.get(site_category, set())
+    if product_category not in misleading_site_categories.get(site_category, set()):
+        return False
+    if site_category in {"elettronica", "giochi"}:
+        return True
+    return product_score >= max(2, site_score)
+
+
+def high_confidence_product_category(text: str) -> str | None:
+    normalized = normalize_text(text)
+    if not normalized:
+        return None
+    for category, patterns in HIGH_CONFIDENCE_CATEGORY_RULES:
+        if any(re.search(pattern, normalized) for pattern in patterns):
+            return category
+    return None
 
 
 def classify_category(text: str, site_text: str = "") -> str:
     normalized_text = text.lower()
     normalized_site = site_text.lower()
+    strong_product_category = high_confidence_product_category(text)
+    if strong_product_category is not None:
+        return render_category(strong_product_category, normalized_site, normalized_text)
 
     site_category, site_score = best_keyword_category(normalized_site, SITE_CATEGORY_KEYWORDS)
     product_category, product_score = best_keyword_category(normalized_text, CATEGORY_KEYWORDS)
@@ -1011,9 +1149,14 @@ def fallback_category(text: str, site_text: str = "") -> str:
     combined = f"{site_text} {text}".strip()
     if not combined:
         return "casa"
-    if re.search(r"\b(?:mah|usb|hdmi|hz|gb|tb|bluetooth|wifi|wi fi|4k|5g)\b", combined):
+    if re.search(
+        r"\b(?:mah|usb|hdmi|hz|gb|tb|bluetooth|wifi|wi fi|4k|5g|oled|qled|hdr|dolby|rgb|ips|lcd|led)\b",
+        combined,
+    ):
         return "elettronica"
-    if re.search(r"\b(?:ml|litri|kg|gr|gusto|ingredienti|senza zucchero|proteine)\b", combined):
+    if re.search(r"\b(?:gusto|ingredienti|senza zucchero|proteine)\b", combined):
+        return "alimentari"
+    if re.search(r"\b\d+(?:[,.]\d+)?\s*(?:ml|litri|kg|gr)\b", combined):
         return "alimentari"
     if re.search(r"\b(?:cm|cotone|polipropilene|acciaio|legno|ceramica|vetro|bagno|camera|filtro|filtri)\b", combined):
         return "casa"
