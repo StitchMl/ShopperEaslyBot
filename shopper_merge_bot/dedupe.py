@@ -37,6 +37,15 @@ class OfferSource:
     added_at: int
 
 
+@dataclass(frozen=True)
+class MenuMessage:
+    menu_key: str
+    message_id: int
+    extra_message_ids: tuple[int, ...]
+    title: str
+    updated_at: int
+
+
 class DedupeStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -109,6 +118,14 @@ class DedupeStore:
 
             CREATE INDEX IF NOT EXISTS idx_offer_sources_message
             ON offer_sources(source_chat_id, source_message_id);
+
+            CREATE TABLE IF NOT EXISTS menu_messages (
+                menu_key TEXT PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                extra_message_ids TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL
+            );
             """
         )
         self._ensure_column("offers", "link_checked_at", "INTEGER")
@@ -555,6 +572,93 @@ class DedupeStore:
             )
             for row in rows
         ]
+
+    def offer_latest_source_at(self, fingerprint: str) -> int:
+        row = self._conn.execute(
+            """
+            SELECT MAX(added_at)
+            FROM offer_sources
+            WHERE fingerprint = ?
+            """,
+            (fingerprint,),
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def get_menu_message(self, menu_key: str) -> MenuMessage | None:
+        row = self._conn.execute(
+            """
+            SELECT menu_key, message_id, extra_message_ids, title, updated_at
+            FROM menu_messages
+            WHERE menu_key = ?
+            """,
+            (menu_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        extra_ids = tuple(
+            int(item) for item in str(row[2]).split(",") if item.strip().isdigit()
+        )
+        return MenuMessage(
+            menu_key=str(row[0]),
+            message_id=int(row[1]),
+            extra_message_ids=extra_ids,
+            title=str(row[3]),
+            updated_at=int(row[4]),
+        )
+
+    def list_menu_messages(self) -> list[MenuMessage]:
+        rows = self._conn.execute(
+            """
+            SELECT menu_key, message_id, extra_message_ids, title, updated_at
+            FROM menu_messages
+            ORDER BY lower(title), menu_key
+            """
+        ).fetchall()
+        menus = []
+        for row in rows:
+            extra_ids = tuple(
+                int(item) for item in str(row[2]).split(",") if item.strip().isdigit()
+            )
+            menus.append(
+                MenuMessage(
+                    menu_key=str(row[0]),
+                    message_id=int(row[1]),
+                    extra_message_ids=extra_ids,
+                    title=str(row[3]),
+                    updated_at=int(row[4]),
+                )
+            )
+        return menus
+
+    def save_menu_message(
+        self,
+        *,
+        menu_key: str,
+        message_id: int,
+        extra_message_ids: tuple[int, ...] = (),
+        title: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO menu_messages(menu_key, message_id, extra_message_ids, title, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(menu_key) DO UPDATE SET
+                message_id = excluded.message_id,
+                extra_message_ids = excluded.extra_message_ids,
+                title = excluded.title,
+                updated_at = excluded.updated_at
+            """,
+            (
+                menu_key,
+                int(message_id),
+                ",".join(str(item) for item in extra_message_ids),
+                title,
+                int(time.time()),
+            ),
+        )
+
+    def delete_menu_message(self, menu_key: str) -> None:
+        self._conn.execute("DELETE FROM menu_messages WHERE menu_key = ?", (menu_key,))
 
     def fingerprints_for_source_message(
         self,

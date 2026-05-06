@@ -12,21 +12,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Iterable
 
-from telethon import TelegramClient, events, utils
+from telethon import Button, TelegramClient, events, utils
 from telethon.errors import AccessTokenInvalidError, ApiIdInvalidError, FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import Channel, Chat, Message, User
+from telethon.tl.types import Channel, Chat, Message, PeerChannel, PeerChat, PeerUser, User
 
 from . import __version__
 from .chat_folder import import_chat_folder
 from .config import ConfigError, Settings, parse_chat_ref
-from .dedupe import DedupeStore, OfferRecord, OfferSource
+from .dedupe import DedupeStore, MenuMessage, OfferRecord, OfferSource
 from .formatter import trim_text
 from .normalization import build_fingerprint, canonicalize_url, normalize_text, resolve_redirect_url
 from .offer_analysis import (
@@ -44,10 +45,16 @@ CAPTION_LIMIT = 1024
 BOT_API_BASE = "https://api.telegram.org/bot"
 PRIVATE_DELETE_SCAN_LIMIT = 10000
 PRIVATE_DELETE_CACHE_SECONDS = 180.0
+PUBLISH_MODE_POSTS = "posts"
+PUBLISH_MODE_MENU_ONLY = "menu-only"
+MENU_NEW_WINDOW_SECONDS = 24 * 60 * 60
+MENU_MAX_OFFERS = 25
+MENU_DETAIL_PAGE_SIZE = 10
+MENU_INDEX_KEY = "menu:index"
 PRODUCT_GIF_FRAME_DURATION_MS = 1200
 PRODUCT_GIF_MAX_FRAMES = 12
 PRODUCT_GIF_MAX_SIDE = 900
-PRODUCT_GIF_FETCH_TIMEOUT_SECONDS = 30
+PRODUCT_GIF_FETCH_TIMEOUT_SECONDS = 8
 PRODUCT_GIF_UPLOAD_TIMEOUT_SECONDS = 60
 PRIVATE_DIALOG_CACHES: dict[tuple[int, str], "PrivateDialogCache"] = {}
 
@@ -445,6 +452,21 @@ def format_price(value: object) -> str:
     return f"{amount:.2f}".replace(".", ",") + " EUR"
 
 
+def publish_mode(store: DedupeStore) -> str:
+    configured = (store.get_config("publish_mode") or PUBLISH_MODE_POSTS).strip().lower()
+    return PUBLISH_MODE_MENU_ONLY if configured in {"menu", "menu-only", "menu_only"} else PUBLISH_MODE_POSTS
+
+
+def is_menu_only_enabled(store: DedupeStore) -> bool:
+    return publish_mode(store) == PUBLISH_MODE_MENU_ONLY
+
+
+def set_publish_mode(store: DedupeStore, mode: str) -> str:
+    normalized = PUBLISH_MODE_MENU_ONLY if mode in {"menu", "menu-only", "menu_only"} else PUBLISH_MODE_POSTS
+    store.set_config("publish_mode", normalized)
+    return normalized
+
+
 def savings_line(original_price: object, current_price: object) -> str | None:
     try:
         original = Decimal(str(original_price))
@@ -499,6 +521,307 @@ def build_offer_publish_text_from_body(
     if len(sources) > 1:
         text += f"\n🔁 Confermata da {len(sources)} fonti"
     return trim_text(text, max_chars)
+
+
+MENU_TYPE_RULES: tuple[tuple[tuple[str, ...], str, str, tuple[str, ...]], ...] = (
+    (("elettronica",), "cuffie", "Cuffie", ("cuffie", "auricolari", "headphones", "earbuds", "quietcomfort")),
+    (("elettronica",), "casse", "Casse e speaker", ("speaker", "cassa", "casse", "altoparlante", "soundbar", "xboom", "jbl")),
+    (("elettronica",), "computer", "Computer", ("notebook", "laptop", "computer", "mini pc", "desktop", "macbook", "pavilion", "elitebook")),
+    (("elettronica",), "monitor", "Monitor", ("monitor", "fullhd", "full hd", "qhd", "uhd")),
+    (("elettronica",), "smartphone", "Smartphone", ("smartphone", "telefono", "iphone", "samsung galaxy", "xiaomi", "redmi", "oneplus", "oppo", "realme")),
+    (("elettronica",), "storage", "Storage", ("ssd", "hard disk", "hdd", "microsd", "micro sd", "scheda sd", "memory card", "sandisk")),
+    (("elettronica",), "tv-video", "TV e video", ("tv", "televisore", "proiettore", "projector", "videocamera", "fotocamera")),
+    (("elettronica",), "gaming", "Gaming", ("console", "playstation", "xbox", "nintendo", "gaming")),
+    (("elettronica",), "accessori-tech", "Accessori tech", ("caricatore", "powerbank", "cavo usb", "usb-c", "magsafe", "router", "mouse", "tastiera")),
+    (("giochi",), "lego", "LEGO", ("lego",)),
+    (("giochi",), "videogiochi", "Videogiochi", ("videogioco", "videogiochi", "nintendo", "super mario", "playstation", "xbox", "switch")),
+    (("giochi",), "giochi-bambini", "Giochi bambini", ("giocattolo", "bambola", "bambole", "peluche", "playmobil", "hot wheels", "barbie", "gormi")),
+    (("software",), "licenze", "Licenze e codici", ("licenza", "codice digitale", "gift card", "windows", "office", "antivirus")),
+    (("software",), "abbonamenti", "Abbonamenti", ("abbonamento", "vpn", "cloud storage", "playstation plus", "xbox game pass")),
+    (("casa",), "cucina", "Cucina", ("cucina", "friggitrice", "forno", "microonde", "pentola", "padella", "barbecue", "weber")),
+    (("casa",), "pulizia", "Pulizia casa", ("aspirapolvere", "pulizia", "detersivo", "ammorbidente")),
+    (("fai-da-te",), "utensili", "Utensili", ("utensile", "trapano", "avvitatore", "paranco", "puleggia", "ribimex")),
+    (("bellezza",), "makeup", "Make-up", ("fondotinta", "makeup", "make up", "smalto", "rossetto", "mascara")),
+    (("bellezza",), "cura-persona", "Cura persona", ("crema", "shampoo", "rasoio", "spazzolino", "deodorante", "profumo")),
+    (("animali",), "gatti", "Gatti", ("gatto", "gatti", "lettiera", "inaba")),
+    (("animali",), "cani", "Cani", ("cane", "cani")),
+)
+
+MENU_CATEGORY_TITLES = {
+    "accessori": "Accessori",
+    "alimentari": "Alimentari",
+    "animali": "Animali",
+    "auto": "Auto",
+    "bellezza": "Bellezza",
+    "casa": "Casa",
+    "elettronica": "Elettronica",
+    "fai-da-te": "Fai-da-te",
+    "giochi": "Giochi",
+    "infanzia": "Infanzia",
+    "libri": "Libri",
+    "moda": "Moda",
+    "musica": "Musica",
+    "software": "Software",
+    "sport": "Sport",
+    "ufficio": "Ufficio",
+    "viaggi": "Viaggi",
+}
+
+
+def keyword_in_normalized_text(keyword: str, text: str) -> bool:
+    keyword = normalize_text(keyword)
+    if not keyword:
+        return False
+    if " " in keyword:
+        return keyword in text
+    return f" {keyword} " in f" {text} "
+
+
+def menu_category(category: str) -> str:
+    return category.split("/", 1)[0].strip().lower() or "altro"
+
+
+def menu_category_title(category: str) -> str:
+    return MENU_CATEGORY_TITLES.get(category, category.replace("-", " ").title())
+
+
+def menu_slug_title(category: str, slug: str) -> str:
+    if not slug or slug == "all":
+        return menu_category_title(category)
+    for categories, rule_slug, title, _keywords in MENU_TYPE_RULES:
+        if category in categories and slug == rule_slug:
+            return title
+    return slug.replace("-", " ").title()
+
+
+def offer_menu_type(offer: OfferRecord) -> tuple[str, str]:
+    category = menu_category(offer.category)
+    haystack = normalize_text(f"{offer.category} {offer_record_product(offer) or ''} {offer.text}")
+    for categories, slug, title, keywords in MENU_TYPE_RULES:
+        if category not in categories:
+            continue
+        if any(keyword_in_normalized_text(keyword, haystack) for keyword in keywords):
+            return slug, title
+    fallback_titles = {
+        "elettronica": "Altra elettronica",
+        "giochi": "Altri giochi",
+        "software": "Altro software",
+        "casa": "Casa",
+        "fai-da-te": "Fai-da-te",
+        "bellezza": "Bellezza",
+        "animali": "Animali",
+    }
+    return "altro", fallback_titles.get(category, category.replace("-", " ").title())
+
+
+def offer_menu_key(offer: OfferRecord) -> str:
+    slug, _title = offer_menu_type(offer)
+    return f"{menu_category(offer.category)}:{slug}"
+
+
+def menu_title_for_key(menu_key: str, offers: list[OfferRecord]) -> str:
+    if offers:
+        _slug, title = offer_menu_type(offers[0])
+        return f"{menu_category(offers[0].category)} / {title}"
+    category, _, slug = menu_key.partition(":")
+    return f"{category} / {menu_slug_title(category, slug)}"
+
+
+def grouped_active_offers(store: DedupeStore) -> dict[str, list[OfferRecord]]:
+    groups: dict[str, list[OfferRecord]] = {}
+    for offer in store.list_active_offers():
+        if not passes_filters(store, offer.category, offer.price):
+            continue
+        groups.setdefault(offer_menu_key(offer), []).append(offer)
+    return groups
+
+
+def selected_menu_categories(store: DedupeStore) -> tuple[str, ...]:
+    categories: list[str] = []
+    for item in store.get_filter_categories():
+        if item == "altro":
+            continue
+        category = menu_category(item)
+        if category not in categories:
+            categories.append(category)
+    return tuple(categories)
+
+
+def render_menu_offer_line(store: DedupeStore, index: int, offer: OfferRecord, now: int) -> list[str]:
+    latest_at = store.offer_latest_source_at(offer.fingerprint)
+    is_new = latest_at >= now - MENU_NEW_WINDOW_SECONDS
+    product = trim_text(offer_record_product(offer) or "Prodotto", 86)
+    source_count = len(store.offer_source_messages(offer.fingerprint))
+    price = format_price(offer.price) if offer.price is not None else "prezzo n/d"
+    urls = offer_record_urls(offer)
+    marker = "[NUOVA] " if is_new else ""
+    source_text = f" | Fonti: {source_count}" if source_count > 1 else ""
+    lines = [f"{marker}{index}. {product}", f"   {price}{source_text}"]
+    if urls:
+        lines.append(f"   {urls[0]}")
+    return lines
+
+
+def render_offer_menu_text(
+    store: DedupeStore,
+    menu_key: str,
+    offers: list[OfferRecord],
+    max_chars: int,
+) -> str:
+    now = int(time.time())
+    title = menu_title_for_key(menu_key, offers)
+    new_count = sum(
+        1
+        for offer in offers
+        if store.offer_latest_source_at(offer.fingerprint) >= now - MENU_NEW_WINDOW_SECONDS
+    )
+    updated_at = datetime.fromtimestamp(now).strftime("%d/%m/%Y %H:%M")
+    lines = [
+        f"Shopper Easly - {title}",
+        f"Offerte attive: {len(offers)} | NUOVE 24h: {new_count}",
+        f"Aggiornato: {updated_at}",
+        "",
+    ]
+    for index, offer in enumerate(offers[:MENU_MAX_OFFERS], start=1):
+        lines.extend(render_menu_offer_line(store, index, offer, now))
+        lines.append("")
+    remaining = len(offers) - MENU_MAX_OFFERS
+    if remaining > 0:
+        lines.append(f"... altre {remaining} offerte in questo gruppo.")
+    return trim_text("\n".join(lines).strip(), max_chars)
+
+
+def menu_group_summaries(store: DedupeStore) -> list[tuple[str, str, int, int]]:
+    now = int(time.time())
+    summaries = []
+    groups = grouped_active_offers(store)
+    for menu_key, offers in groups.items():
+        title = menu_title_for_key(menu_key, offers)
+        new_count = sum(
+            1
+            for offer in offers
+            if store.offer_latest_source_at(offer.fingerprint) >= now - MENU_NEW_WINDOW_SECONDS
+        )
+        summaries.append((menu_key, title, len(offers), new_count))
+    covered_categories = {menu_key_parts(menu_key)[0] for menu_key in groups}
+    for category in selected_menu_categories(store):
+        if category in covered_categories:
+            continue
+        menu_key = f"{category}:all"
+        summaries.append((menu_key, menu_title_for_key(menu_key, []), 0, 0))
+    return sorted(summaries, key=lambda item: (item[1].lower(), item[0]))
+
+
+def render_menu_index_text(store: DedupeStore) -> str:
+    summaries = menu_group_summaries(store)
+    total_offers = sum(total for _key, _title, total, _new_count in summaries)
+    total_new = sum(new_count for _key, _title, _total, new_count in summaries)
+    updated_at = datetime.fromtimestamp(int(time.time())).strftime("%d/%m/%Y %H:%M")
+    lines = [
+        "Shopper Easly - Menu offerte",
+        f"Offerte attive: {total_offers} | NUOVE 24h: {total_new}",
+        f"Aggiornato: {updated_at}",
+        "",
+    ]
+    if not summaries:
+        lines.append("Nessuna offerta attiva nei filtri correnti.")
+    else:
+        lines.append("Scegli una tipologia dai pulsanti qui sotto.")
+        lines.append("[NUOVO] indica prodotti arrivati o aggiornati nelle ultime 24h.")
+    return "\n".join(lines).strip()
+
+
+def menu_key_parts(menu_key: str) -> tuple[str, str]:
+    category, separator, slug = menu_key.partition(":")
+    if not separator:
+        return category, "altro"
+    return category, slug
+
+
+def menu_callback_data(action: str, menu_key: str, page: int = 0) -> bytes:
+    category, slug = menu_key_parts(menu_key)
+    return f"menu:{action}:{category}:{slug}:{max(0, page)}".encode("utf-8")[:64]
+
+
+def parse_menu_callback_data(data: bytes) -> tuple[str, str, int] | None:
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    parts = decoded.split(":")
+    if len(parts) < 2 or parts[0] != "menu":
+        return None
+    action = parts[1]
+    if action == "close":
+        return action, "", 0
+    if action != "open" or len(parts) != 5:
+        return None
+    try:
+        page = max(0, int(parts[4]))
+    except ValueError:
+        page = 0
+    return action, f"{parts[2]}:{parts[3]}", page
+
+
+def menu_index_buttons(store: DedupeStore) -> list[list[Button]]:
+    buttons = []
+    for menu_key, title, total, new_count in menu_group_summaries(store):
+        label = f"{'[NUOVO] ' if new_count else ''}{title} ({total})"
+        buttons.append([Button.inline(label, menu_callback_data("open", menu_key, 0))])
+    return buttons
+
+
+def render_offer_menu_detail_text(
+    store: DedupeStore,
+    menu_key: str,
+    offers: list[OfferRecord],
+    page: int,
+    max_chars: int,
+) -> str:
+    title = menu_title_for_key(menu_key, offers)
+    now = int(time.time())
+    new_count = sum(
+        1
+        for offer in offers
+        if store.offer_latest_source_at(offer.fingerprint) >= now - MENU_NEW_WINDOW_SECONDS
+    )
+    if not offers:
+        lines = [
+            f"Shopper Easly - {title}",
+            "Offerte attive: 0 | NUOVE 24h: 0",
+            "",
+            "Nessuna offerta attiva in questa tipologia.",
+        ]
+        return trim_text("\n".join(lines).strip(), max_chars)
+    page_count = max(1, (len(offers) + MENU_DETAIL_PAGE_SIZE - 1) // MENU_DETAIL_PAGE_SIZE)
+    page = min(max(0, page), page_count - 1)
+    start = page * MENU_DETAIL_PAGE_SIZE
+    page_offers = offers[start : start + MENU_DETAIL_PAGE_SIZE]
+    lines = [
+        f"Shopper Easly - {title}",
+        f"Offerte attive: {len(offers)} | NUOVE 24h: {new_count}",
+        f"Pagina {page + 1}/{page_count}",
+        "",
+    ]
+    for index, offer in enumerate(page_offers, start=start + 1):
+        lines.extend(render_menu_offer_line(store, index, offer, now))
+        lines.append("")
+    return trim_text("\n".join(lines).strip(), max_chars)
+
+
+def menu_detail_buttons(menu_key: str, page: int, offer_count: int) -> list[list[Button]]:
+    page_count = max(1, (offer_count + MENU_DETAIL_PAGE_SIZE - 1) // MENU_DETAIL_PAGE_SIZE)
+    page = min(max(0, page), page_count - 1)
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("Indietro", menu_callback_data("open", menu_key, page - 1)))
+    if page + 1 < page_count:
+        nav.append(Button.inline("Avanti", menu_callback_data("open", menu_key, page + 1)))
+    rows = []
+    if nav:
+        rows.append(nav)
+    rows.append([Button.inline("Chiudi", b"menu:close")])
+    return rows
 
 
 def stable_offer_body(*, product: str, original_price: object, current_price: object, offer_url: str) -> str:
@@ -820,13 +1143,27 @@ def source_entity_candidates(source_chat_id: str) -> tuple[object, ...]:
             candidates.append(value)
 
     cleaned = source_chat_id.strip()
-    if cleaned:
-        add(cleaned)
     try:
         numeric = int(cleaned)
     except ValueError:
+        if cleaned:
+            add(cleaned)
         return tuple(candidates)
+
+    try:
+        resolved_id, peer_type = utils.resolve_id(numeric)
+        if peer_type is PeerChannel:
+            add(PeerChannel(resolved_id))
+        elif peer_type is PeerChat:
+            add(PeerChat(resolved_id))
+        elif peer_type is PeerUser:
+            add(PeerUser(resolved_id))
+    except Exception:
+        pass
+
     add(numeric)
+    if cleaned:
+        add(cleaned)
     if cleaned.startswith("-100") and len(cleaned) > 4:
         try:
             add(int(cleaned[4:]))
@@ -870,9 +1207,9 @@ async def edit_or_replace_offer_with_gif(
     target_has_media: bool,
 ) -> bool:
     senders_tuple = tuple(senders)
-    for sender in senders_tuple:
-        try:
-            if target_has_media:
+    if target_has_media:
+        for sender in senders_tuple:
+            try:
                 await asyncio.wait_for(
                     sender.edit_message(
                         destination,
@@ -884,7 +1221,16 @@ async def edit_or_replace_offer_with_gif(
                     timeout=PRODUCT_GIF_UPLOAD_TIMEOUT_SECONDS,
                 )
                 return True
+            except Exception as exc:
+                LOGGER.warning(
+                    "Could not edit offer %s media GIF with %s: %s",
+                    offer.fingerprint,
+                    sender.session.__class__.__name__,
+                    exc,
+                )
 
+    for sender in senders_tuple:
+        try:
             result = await asyncio.wait_for(
                 sender.send_file(
                     destination,
@@ -912,7 +1258,7 @@ async def edit_or_replace_offer_with_gif(
             return True
         except Exception as exc:
             LOGGER.warning(
-                "Could not publish offer %s GIF with %s: %s",
+                "Could not replace offer %s with GIF via %s: %s",
                 offer.fingerprint,
                 sender.session.__class__.__name__,
                 exc,
@@ -1093,6 +1439,281 @@ async def edit_offer_message(
                 exc,
             )
     return False
+
+
+async def send_menu_message(
+    sender: TelegramClient,
+    destination: object,
+    text: str,
+    buttons: object | None = None,
+) -> list[int]:
+    result = await sender.send_message(
+        destination,
+        text,
+        buttons=buttons,
+        link_preview=False,
+        parse_mode=None,
+    )
+    return _message_ids_from_result(result)
+
+
+async def edit_menu_message(
+    senders: Iterable[TelegramClient],
+    destination: object,
+    menu: MenuMessage,
+    text: str,
+    buttons: object | None = None,
+) -> bool:
+    for sender in senders:
+        try:
+            await sender.edit_message(
+                destination,
+                menu.message_id,
+                text,
+                buttons=buttons,
+                parse_mode=None,
+                link_preview=False,
+            )
+            return True
+        except Exception as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            LOGGER.warning(
+                "Could not edit menu %s with %s: %s",
+                menu.menu_key,
+                sender.session.__class__.__name__,
+                exc,
+            )
+    return False
+
+
+async def upsert_offer_menu(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object,
+    store: DedupeStore,
+    menu_key: str,
+    offers: list[OfferRecord],
+    max_chars: int,
+) -> bool:
+    if not offers:
+        return await delete_offer_menu(
+            senders=senders,
+            destination=destination,
+            store=store,
+            menu_key=menu_key,
+        )
+    title = menu_title_for_key(menu_key, offers)
+    text = render_offer_menu_text(store, menu_key, offers, max_chars)
+    menu = store.get_menu_message(menu_key)
+    senders_tuple = tuple(senders)
+    if menu is not None and menu.message_id:
+        if await edit_menu_message(senders_tuple, destination, menu, text):
+            store.save_menu_message(
+                menu_key=menu_key,
+                message_id=menu.message_id,
+                extra_message_ids=menu.extra_message_ids,
+                title=title,
+            )
+            return True
+        store.delete_menu_message(menu_key)
+
+    sender = senders_tuple[0] if senders_tuple else None
+    if sender is None:
+        return False
+    try:
+        message_ids = await send_menu_message(sender, destination, text)
+    except Exception as exc:
+        LOGGER.warning("Could not send menu %s: %s", menu_key, exc)
+        return False
+    if not message_ids:
+        return False
+    store.save_menu_message(
+        menu_key=menu_key,
+        message_id=message_ids[0],
+        extra_message_ids=tuple(message_ids[1:]),
+        title=title,
+    )
+    return True
+
+
+async def upsert_menu_index(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object,
+    store: DedupeStore,
+) -> bool:
+    text = render_menu_index_text(store)
+    buttons = menu_index_buttons(store) or None
+    title = "Menu offerte"
+    menu = store.get_menu_message(MENU_INDEX_KEY)
+    senders_tuple = tuple(senders)
+    if menu is not None and menu.message_id:
+        if await edit_menu_message(senders_tuple, destination, menu, text, buttons=buttons):
+            store.save_menu_message(
+                menu_key=MENU_INDEX_KEY,
+                message_id=menu.message_id,
+                extra_message_ids=menu.extra_message_ids,
+                title=title,
+            )
+            return True
+        store.delete_menu_message(MENU_INDEX_KEY)
+
+    sender = senders_tuple[0] if senders_tuple else None
+    if sender is None:
+        return False
+    try:
+        message_ids = await send_menu_message(sender, destination, text, buttons=buttons)
+    except Exception as exc:
+        LOGGER.warning("Could not send menu index: %s", exc)
+        return False
+    if not message_ids:
+        return False
+    store.save_menu_message(
+        menu_key=MENU_INDEX_KEY,
+        message_id=message_ids[0],
+        extra_message_ids=tuple(message_ids[1:]),
+        title=title,
+    )
+    return True
+
+
+async def delete_legacy_offer_menus(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object,
+    store: DedupeStore,
+) -> tuple[int, int]:
+    deleted = 0
+    failed = 0
+    for menu in store.list_menu_messages():
+        if menu.menu_key == MENU_INDEX_KEY:
+            continue
+        if await delete_offer_menu(
+            senders=senders,
+            destination=destination,
+            store=store,
+            menu_key=menu.menu_key,
+        ):
+            deleted += 1
+        else:
+            failed += 1
+    return deleted, failed
+
+
+async def delete_offer_menu(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object,
+    store: DedupeStore,
+    menu_key: str,
+) -> bool:
+    menu = store.get_menu_message(menu_key)
+    if menu is None:
+        return True
+    ids = [menu.message_id, *menu.extra_message_ids]
+    deleted = await delete_messages_with_fallback(senders, destination, ids)
+    if deleted:
+        store.delete_menu_message(menu_key)
+    return deleted
+
+
+async def sync_offer_menus(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object | None,
+    store: DedupeStore,
+    max_chars: int,
+    menu_keys: set[str] | None = None,
+) -> tuple[int, int, int]:
+    if destination is None:
+        return 0, 0, 1
+    updated = 0
+    deleted, failed = await delete_legacy_offer_menus(
+        senders=senders,
+        destination=destination,
+        store=store,
+    )
+    if await upsert_menu_index(
+        senders=senders,
+        destination=destination,
+        store=store,
+    ):
+        updated += 1
+    else:
+        failed += 1
+    return updated, deleted, failed
+
+
+async def sync_offer_menu_for_offer(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object | None,
+    store: DedupeStore,
+    offer: OfferRecord,
+    max_chars: int,
+    previous_menu_key: str | None = None,
+) -> tuple[int, int, int]:
+    menu_keys = {offer_menu_key(offer)}
+    if previous_menu_key:
+        menu_keys.add(previous_menu_key)
+    return await sync_offer_menus(
+        senders=senders,
+        destination=destination,
+        store=store,
+        max_chars=max_chars,
+        menu_keys=menu_keys,
+    )
+
+
+async def migrate_active_posts_to_menu_only(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object | None,
+    store: DedupeStore,
+    max_chars: int,
+) -> tuple[int, int, int, int]:
+    if destination is None:
+        return 0, 0, 0, 1
+    menu_updated, _menu_deleted, menu_failed = await sync_offer_menus(
+        senders=senders,
+        destination=destination,
+        store=store,
+        max_chars=max_chars,
+    )
+    menu_ids = {
+        menu.message_id
+        for menu in store.list_menu_messages()
+        if menu.message_id
+    }
+    offer_ids: dict[int, str] = {}
+    for offer in store.list_active_offers():
+        ids = [offer.primary_message_id, *offer.extra_message_ids]
+        for message_id in ids:
+            if message_id and message_id not in menu_ids:
+                offer_ids[int(message_id)] = offer.fingerprint
+
+    deleted_posts = 0
+    failed = menu_failed
+    ids = sorted(offer_ids)
+    for start in range(0, len(ids), 100):
+        chunk = ids[start : start + 100]
+        if await delete_messages_with_fallback(senders, destination, chunk):
+            deleted_posts += len(chunk)
+            for fingerprint in {offer_ids[message_id] for message_id in chunk}:
+                store.update_offer_delivery(fingerprint, 0, ())
+        else:
+            failed += len(chunk)
+    legacy_scanned = 0
+    if is_private_user_destination(destination):
+        legacy_scanned, legacy_deleted, legacy_failed = await purge_private_structured_offer_messages(
+            senders=senders,
+            destination=destination,
+            limit=PRIVATE_DELETE_SCAN_LIMIT,
+        )
+        deleted_posts += legacy_deleted
+        failed += legacy_failed
+    return menu_updated, len(ids) + legacy_scanned, deleted_posts, failed
 
 
 async def delete_messages_with_fallback(
@@ -2133,6 +2754,49 @@ def message_passes_history_filters(store: DedupeStore, message: PublishedOfferMe
     return passes_filters(store, message.category or "altro", message.current_price)
 
 
+async def purge_private_structured_offer_messages(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object,
+    limit: int,
+) -> tuple[int, int, int]:
+    token = bot_api_token()
+    if token is None:
+        return 0, 0, 1
+
+    cache = await load_private_dialog_cache(
+        senders=senders,
+        bot_token=token,
+        destination=destination,
+    )
+    if cache is None:
+        return 0, 0, 1
+
+    scanned_messages = cache.messages if limit <= 0 else cache.messages[:limit]
+    delete_ids = sorted({message.message_id for message in scanned_messages})
+    if not delete_ids:
+        return len(scanned_messages), 0, 0
+
+    deleted = 0
+    failed = 0
+    deleted_ids: set[int] = set()
+    for start in range(0, len(delete_ids), 100):
+        chunk = delete_ids[start : start + 100]
+        try:
+            await cache.user_client.delete_messages(cache.bot_entity, chunk, revoke=False)
+            deleted += len(chunk)
+            deleted_ids.update(chunk)
+        except Exception as exc:
+            LOGGER.warning("Could not purge private structured offer messages %s: %s", chunk[:5], exc)
+            failed += len(chunk)
+
+    if deleted_ids:
+        cache.messages = [
+            message for message in cache.messages if message.message_id not in deleted_ids
+        ]
+    return len(scanned_messages), deleted, failed
+
+
 async def purge_private_history_messages(
     *,
     senders: Iterable[TelegramClient],
@@ -2326,26 +2990,42 @@ async def handle_message(
     facts = analyze_offer(raw_text, offer_urls, site_text=site_category_context)
     if facts.invalid:
         expired_fingerprints = mapped_fingerprints | fingerprints_from_urls(offer_urls)
+        deleted_any = False
         for fingerprint in expired_fingerprints:
-            await delete_offer(
+            deleted_any = await delete_offer(
                 cleanup_senders,
                 destination,
                 store,
                 fingerprint,
                 "invalid-source-edit",
+            ) or deleted_any
+        if deleted_any and is_menu_only_enabled(store) and not settings.dry_run:
+            await sync_offer_menus(
+                senders=cleanup_senders,
+                destination=destination,
+                store=store,
+                max_chars=settings.max_text_chars,
             )
         mark_seen_message(store, source_ids, message_id)
         return
 
     if not facts.complete:
         if allow_seen_update:
+            deleted_any = False
             for fingerprint in mapped_fingerprints:
-                await delete_offer(
+                deleted_any = await delete_offer(
                     cleanup_senders,
                     destination,
                     store,
                     fingerprint,
                     "incomplete-source-edit",
+                ) or deleted_any
+            if deleted_any and is_menu_only_enabled(store) and not settings.dry_run:
+                await sync_offer_menus(
+                    senders=cleanup_senders,
+                    destination=destination,
+                    store=store,
+                    max_chars=settings.max_text_chars,
                 )
         mark_seen_message(store, source_ids, message_id)
         LOGGER.info("Incomplete offer skipped from %s/%s", source_id, message_id)
@@ -2370,13 +3050,21 @@ async def handle_message(
     title = await chat_title(message)
     if not passes_filters(store, facts.category, facts.price):
         if allow_seen_update:
+            deleted_any = False
             for fingerprint in mapped_fingerprints:
-                await delete_offer(
+                deleted_any = await delete_offer(
                     cleanup_senders,
                     destination,
                     store,
                     fingerprint,
                     "source-edited-filtered",
+                ) or deleted_any
+            if deleted_any and is_menu_only_enabled(store) and not settings.dry_run:
+                await sync_offer_menus(
+                    senders=cleanup_senders,
+                    destination=destination,
+                    store=store,
+                    max_chars=settings.max_text_chars,
                 )
         LOGGER.info(
             "Filtered message from %s/%s category=%s price=%s",
@@ -2396,13 +3084,21 @@ async def handle_message(
         offer_url=str(facts.offer_url),
     )
     stale_fingerprints = mapped_fingerprints - {fingerprint}
+    stale_deleted = False
     for stale_fingerprint in stale_fingerprints:
-        await delete_offer(
+        stale_deleted = await delete_offer(
             cleanup_senders,
             destination,
             store,
             stale_fingerprint,
             "source-edited-new-offer",
+        ) or stale_deleted
+    if stale_deleted and is_menu_only_enabled(store) and not settings.dry_run:
+        await sync_offer_menus(
+            senders=cleanup_senders,
+            destination=destination,
+            store=store,
+            max_chars=settings.max_text_chars,
         )
 
     async with state.offer_processing_lock:
@@ -2438,21 +3134,31 @@ async def handle_message(
                     max_chars=settings.max_text_chars,
                 )
                 store.update_offer_text(target_fingerprint, existing.text, len(sources))
+                existing = store.get_offer(target_fingerprint) or existing
                 if not settings.dry_run:
-                    media_updated = False
-                    if settings.copy_media and message.media:
-                        source_reader = await first_user_client(cleanup_senders) or sender
-                        media_updated = await refresh_offer_media_gif(
+                    if is_menu_only_enabled(store):
+                        await sync_offer_menu_for_offer(
                             senders=cleanup_senders,
-                            source_reader=source_reader,
                             destination=destination,
                             store=store,
                             offer=existing,
                             max_chars=settings.max_text_chars,
-                            current_source_message=message,
                         )
-                    if not media_updated:
-                        await edit_offer_message(cleanup_senders, destination, existing, merged)
+                    else:
+                        media_updated = False
+                        if settings.copy_media and message.media:
+                            source_reader = await first_user_client(cleanup_senders) or sender
+                            media_updated = await refresh_offer_media_gif(
+                                senders=cleanup_senders,
+                                source_reader=source_reader,
+                                destination=destination,
+                                store=store,
+                                offer=existing,
+                                max_chars=settings.max_text_chars,
+                                current_source_message=message,
+                            )
+                        if not media_updated:
+                            await edit_offer_message(cleanup_senders, destination, existing, merged)
                 LOGGER.info("Merged duplicate offer %s from %s/%s", target_fingerprint, source_id, message_id)
             return
 
@@ -2470,6 +3176,8 @@ async def handle_message(
             message_ids: list[int] = []
             if settings.dry_run:
                 LOGGER.info("DRY_RUN message from %s/%s:\n%s", source_id, message_id, outbound)
+            elif is_menu_only_enabled(store):
+                message_ids = [0]
             else:
                 message_ids = await send_with_retry(
                     sender=sender,
@@ -2496,6 +3204,16 @@ async def handle_message(
                     source_title=title,
                     source_link=source_link or "",
                 )
+                if not settings.dry_run and is_menu_only_enabled(store):
+                    stored_offer = store.get_offer(fingerprint)
+                    if stored_offer is not None:
+                        await sync_offer_menu_for_offer(
+                            senders=cleanup_senders,
+                            destination=destination,
+                            store=store,
+                            offer=stored_offer,
+                            max_chars=settings.max_text_chars,
+                        )
             mark_seen_message(store, source_ids, message_id)
             LOGGER.info("Delivered message from %s/%s", source_id, message_id)
         except Exception:
@@ -2578,6 +3296,17 @@ async def run_expired_offer_checks(
                 tracked_unknown + history_unknown,
                 tracked_failed + history_failed,
             )
+            if (
+                is_menu_only_enabled(store)
+                and tracked_deleted + history_deleted > 0
+                and state.destination is not None
+            ):
+                await sync_offer_menus(
+                    senders=senders,
+                    destination=state.destination,
+                    store=store,
+                    max_chars=settings.max_text_chars,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2606,6 +3335,8 @@ def control_help(user_id: int | None) -> str:
         "/filters - mostra filtri categoria/prezzo",
         "/category <nomi|clear|list> - filtra per categoria",
         "/price <min|max|clear> [valore] - filtra per prezzo",
+        "/publish_mode <posts|menu> - cambia tra post singoli e menu-only",
+        "/menu_sync - ricostruisce/aggiorna tutti i menu",
         "/scan_sources [offerte|notizie] - aggiunge bot, canali e gruppi compatibili",
         "/scan_bots [offerte|notizie] - alias che scansiona tutte le sorgenti",
         "/purge_legacy - elimina offerte pubblicate col vecchio formato",
@@ -2613,6 +3344,7 @@ def control_help(user_id: int | None) -> str:
         "/purge_deleted - ritenta le cancellazioni gia' segnate nel database",
         "/purge_expired [numero|all] - controlla i link e elimina offerte terminate",
         "/purge_unmerged [numero] - elimina duplicati vecchi non registrati nel DB",
+        "/purge_product_posts [numero|all] - elimina i vecchi messaggi prodotto e lascia il menu",
         "/purge_history [numero] [keep=N] - ripulisce la chat privata da offerte vecchie/duplicate/fuori filtro",
         "/recategorize [numero|all] - ricalcola categorie usando il sito dell'offerta",
         "/refresh_gifs [numero|all] - crea GIF per offerte gia' unite con immagini diverse",
@@ -2678,6 +3410,57 @@ async def register_control_bot(
     state: RuntimeState,
 ) -> None:
     cleanup_senders = unique_clients(bot, source_client)
+
+    @bot.on(events.CallbackQuery(pattern=rb"^menu:"))
+    async def on_menu_callback(event: events.CallbackQuery.Event) -> None:
+        sender_id = int(event.sender_id or 0)
+        if not store.is_admin(sender_id, settings.admin_user_ids):
+            await event.answer("Non autorizzato.", alert=True)
+            return
+
+        parsed = parse_menu_callback_data(event.data or b"")
+        if parsed is None:
+            await event.answer("Menu non valido.", alert=True)
+            return
+
+        action, menu_key, page = parsed
+        if action == "close":
+            if state.destination is not None:
+                await delete_messages_with_fallback(
+                    cleanup_senders,
+                    state.destination,
+                    [int(event.message_id)],
+                )
+            else:
+                await event.delete()
+            await event.answer("Chiuso.")
+            return
+
+        offers = grouped_active_offers(store).get(menu_key, [])
+        text = render_offer_menu_detail_text(
+            store,
+            menu_key,
+            offers,
+            page,
+            settings.max_text_chars,
+        )
+        buttons = menu_detail_buttons(menu_key, page, len(offers))
+        index_message = store.get_menu_message(MENU_INDEX_KEY)
+        if index_message is not None and int(event.message_id) == index_message.message_id:
+            await event.respond(
+                text,
+                buttons=buttons,
+                parse_mode=None,
+                link_preview=False,
+            )
+        else:
+            await event.edit(
+                text,
+                buttons=buttons,
+                parse_mode=None,
+                link_preview=False,
+            )
+        await event.answer()
 
     @bot.on(events.NewMessage(pattern=r"^/(start|help)(?:@\w+)?(?:\s|$)"))
     async def on_help(event: events.NewMessage.Event) -> None:
@@ -2868,11 +3651,21 @@ async def register_control_bot(
             destination=state.destination,
             store=store,
         )
+        menu_updated = menu_deleted = menu_failed = 0
+        if is_menu_only_enabled(store):
+            menu_updated, menu_deleted, menu_failed = await sync_offer_menus(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                max_chars=settings.max_text_chars,
+            )
         await event.respond(
             "Filtro categorie impostato: "
             + ", ".join(categories)
             + f"\nOfferte gia' pubblicate rimosse: {deleted}"
-            + (f"\nRimozioni fallite: {failed}" if failed else ""),
+            + (f"\nMenu aggiornati: {menu_updated}" if is_menu_only_enabled(store) else "")
+            + (f"\nMenu rimossi: {menu_deleted}" if menu_deleted else "")
+            + (f"\nRimozioni fallite: {failed + menu_failed}" if failed or menu_failed else ""),
             parse_mode=None,
         )
 
@@ -2911,10 +3704,142 @@ async def register_control_bot(
             destination=state.destination,
             store=store,
         )
+        menu_updated = menu_deleted = menu_failed = 0
+        if is_menu_only_enabled(store):
+            menu_updated, menu_deleted, menu_failed = await sync_offer_menus(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                max_chars=settings.max_text_chars,
+            )
         await event.respond(
             filters_text(store)
             + f"\n\nOfferte gia' pubblicate rimosse: {deleted}"
-            + (f"\nRimozioni fallite: {failed}" if failed else ""),
+            + (f"\nMenu aggiornati: {menu_updated}" if is_menu_only_enabled(store) else "")
+            + (f"\nMenu rimossi: {menu_deleted}" if menu_deleted else "")
+            + (f"\nRimozioni fallite: {failed + menu_failed}" if failed or menu_failed else ""),
+            parse_mode=None,
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/publish_mode(?:@\w+)?(?:\s|$)"))
+    async def on_publish_mode(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+        arg = command_arg(event.raw_text or "").strip().lower()
+        if not arg:
+            await event.respond(f"Modalita pubblicazione: {publish_mode(store)}", parse_mode=None)
+            return
+        if arg not in {"posts", "post", "menu", "menu-only", "menu_only"}:
+            await event.respond("Uso: /publish_mode posts oppure /publish_mode menu", parse_mode=None)
+            return
+        mode = set_publish_mode(store, arg)
+        if mode == PUBLISH_MODE_MENU_ONLY:
+            menu_updated, found_posts, deleted_posts, failed = await migrate_active_posts_to_menu_only(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                max_chars=settings.max_text_chars,
+            )
+            await event.respond(
+                "\n".join(
+                    [
+                        "Modalita menu-only attivata.",
+                        f"Menu aggiornati: {menu_updated}",
+                        f"Vecchi post prodotto trovati: {found_posts}",
+                        f"Vecchi post prodotto rimossi: {deleted_posts}",
+                        f"Operazioni fallite: {failed}",
+                    ]
+                ),
+                parse_mode=None,
+            )
+            return
+        await event.respond(
+            "Modalita post singoli attivata. Le nuove offerte torneranno a essere pubblicate come messaggi separati.",
+            parse_mode=None,
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/menu_sync(?:@\w+)?(?:\s|$)"))
+    async def on_menu_sync(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+        if state.destination is None:
+            await event.respond("Destinazione non configurata.", parse_mode=None)
+            return
+        await event.respond("Aggiorno tutti i menu offerte...", parse_mode=None)
+        updated, deleted, failed = await sync_offer_menus(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+            max_chars=settings.max_text_chars,
+        )
+        legacy_scanned = legacy_deleted = legacy_failed = 0
+        if is_menu_only_enabled(store) and is_private_user_destination(state.destination):
+            legacy_scanned, legacy_deleted, legacy_failed = await purge_private_structured_offer_messages(
+                senders=cleanup_senders,
+                destination=state.destination,
+                limit=PRIVATE_DELETE_SCAN_LIMIT,
+            )
+        await event.respond(
+            "\n".join(
+                [
+                    "Menu aggiornati.",
+                    f"Menu scritti/aggiornati: {updated}",
+                    f"Menu rimossi: {deleted}",
+                    f"Vecchi messaggi prodotto trovati: {legacy_scanned}",
+                    f"Vecchi messaggi prodotto rimossi: {legacy_deleted}",
+                    f"Operazioni fallite: {failed + legacy_failed}",
+                ]
+            ),
+            parse_mode=None,
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/purge_product_posts(?:@\w+)?(?:\s|$)"))
+    async def on_purge_product_posts(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+        if state.destination is None:
+            await event.respond("Destinazione non configurata.", parse_mode=None)
+            return
+        if not is_private_user_destination(state.destination):
+            await event.respond(
+                "Questo comando e' disponibile per la chat privata col bot.",
+                parse_mode=None,
+            )
+            return
+
+        arg = command_arg(event.raw_text or "").strip().lower()
+        limit = PRIVATE_DELETE_SCAN_LIMIT
+        if arg and arg != "all":
+            if not arg.isdigit():
+                await event.respond("Uso: /purge_product_posts [numero|all]", parse_mode=None)
+                return
+            limit = min(max(int(arg), 50), PRIVATE_DELETE_SCAN_LIMIT)
+
+        await event.respond("Elimino i vecchi messaggi prodotto e lascio solo il menu...", parse_mode=None)
+        scanned, deleted, failed = await purge_private_structured_offer_messages(
+            senders=cleanup_senders,
+            destination=state.destination,
+            limit=limit,
+        )
+        menu_updated = menu_deleted = menu_failed = 0
+        if is_menu_only_enabled(store):
+            menu_updated, menu_deleted, menu_failed = await sync_offer_menus(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                max_chars=settings.max_text_chars,
+            )
+        await event.respond(
+            "\n".join(
+                [
+                    "Pulizia messaggi prodotto completata.",
+                    f"Messaggi prodotto trovati: {scanned}",
+                    f"Messaggi prodotto rimossi: {deleted}",
+                    f"Menu aggiornati: {menu_updated}",
+                    f"Menu rimossi: {menu_deleted}",
+                    f"Operazioni fallite: {failed + menu_failed}",
+                ]
+            ),
             parse_mode=None,
         )
 
@@ -3279,30 +4204,49 @@ async def register_control_bot(
             store=store,
             max_chars=settings.max_text_chars,
         )
-        unmerged_deleted, unmerged_groups, unmerged_failed = await purge_unmerged_destination_messages(
-            reader=bot,
-            senders=cleanup_senders,
-            destination=state.destination,
-            store=store,
-            limit=500,
-        )
-        legacy_deleted, legacy_failed = await purge_legacy_offers(
-            senders=cleanup_senders,
-            destination=state.destination,
-            store=store,
-            include_marked_deleted=True,
-        )
-        verified_deleted, verified_failed = await verify_marked_deleted_offers(
-            senders=cleanup_senders,
-            destination=state.destination,
-            store=store,
-        )
-        reformatted, reformat_failed = await reformat_active_offers(
-            senders=cleanup_senders,
-            destination=state.destination,
-            store=store,
-            max_chars=settings.max_text_chars,
-        )
+        menu_updated = menu_deleted = menu_failed = 0
+        if is_menu_only_enabled(store):
+            unmerged_deleted = unmerged_groups = unmerged_failed = 0
+            legacy_deleted = legacy_failed = 0
+            verified_deleted = verified_failed = 0
+            reformatted = reformat_failed = 0
+            menu_updated, menu_deleted, menu_failed = await sync_offer_menus(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                max_chars=settings.max_text_chars,
+            )
+            if is_private_user_destination(state.destination):
+                _legacy_scanned, legacy_deleted, legacy_failed = await purge_private_structured_offer_messages(
+                    senders=cleanup_senders,
+                    destination=state.destination,
+                    limit=PRIVATE_DELETE_SCAN_LIMIT,
+                )
+        else:
+            unmerged_deleted, unmerged_groups, unmerged_failed = await purge_unmerged_destination_messages(
+                reader=bot,
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                limit=500,
+            )
+            legacy_deleted, legacy_failed = await purge_legacy_offers(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                include_marked_deleted=True,
+            )
+            verified_deleted, verified_failed = await verify_marked_deleted_offers(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+            )
+            reformatted, reformat_failed = await reformat_active_offers(
+                senders=cleanup_senders,
+                destination=state.destination,
+                store=store,
+                max_chars=settings.max_text_chars,
+            )
         await event.respond(
             "\n".join(
                 [
@@ -3317,7 +4261,9 @@ async def register_control_bot(
                     f"Legacy eliminati: {legacy_deleted}",
                     f"Cancellazioni gia' segnate verificate: {verified_deleted}",
                     f"Messaggi riformattati: {reformatted}",
-                    f"Operazioni fallite: {filtered_failed + expired_failed + merge_failed + unmerged_failed + legacy_failed + verified_failed + reformat_failed}",
+                    f"Menu aggiornati: {menu_updated}",
+                    f"Menu rimossi: {menu_deleted}",
+                    f"Operazioni fallite: {filtered_failed + expired_failed + merge_failed + unmerged_failed + legacy_failed + verified_failed + reformat_failed + menu_failed}",
                 ]
             ),
             parse_mode=None,
@@ -3428,6 +4374,8 @@ async def register_control_bot(
                     f"Destinazione: {state.destination_ref or 'non impostata'}",
                     f"Monitor all chats: {settings.monitor_all_chats}",
                     f"Dry run: {settings.dry_run}",
+                    f"Modalita pubblicazione: {publish_mode(store)}",
+                    f"Menu attivi: {len(store.list_menu_messages())}",
                     f"Pulizia offerte terminate: /purge_expired disponibile",
                     f"Controllo periodico offerte terminate: {settings.expired_offer_check_interval_seconds}s",
                     "",
@@ -3508,7 +4456,31 @@ async def run(settings: Settings | None = None) -> None:
 
         cleanup_senders = unique_clients(sender, source_client)
         if state.destination is not None:
-            LOGGER.info("Startup maintenance skipped; use /reconcile or /purge_expired to run cleanup")
+            if is_menu_only_enabled(store) and not settings.dry_run:
+                menu_updated, menu_deleted, menu_failed = await sync_offer_menus(
+                    senders=cleanup_senders,
+                    destination=state.destination,
+                    store=store,
+                    max_chars=settings.max_text_chars,
+                )
+                legacy_scanned = legacy_deleted = legacy_failed = 0
+                if is_private_user_destination(state.destination):
+                    legacy_scanned, legacy_deleted, legacy_failed = await purge_private_structured_offer_messages(
+                        senders=cleanup_senders,
+                        destination=state.destination,
+                        limit=PRIVATE_DELETE_SCAN_LIMIT,
+                    )
+                LOGGER.info(
+                    "Startup menu-only maintenance: menu_updated=%s menu_deleted=%s "
+                    "product_scanned=%s product_deleted=%s failed=%s",
+                    menu_updated,
+                    menu_deleted,
+                    legacy_scanned,
+                    legacy_deleted,
+                    menu_failed + legacy_failed,
+                )
+            else:
+                LOGGER.info("Startup maintenance skipped; use /reconcile or /purge_expired to run cleanup")
         limiter = RateLimiter(settings.min_post_interval_seconds)
         sources = await resolve_saved_sources(source_client, store)
         await run_backfill(

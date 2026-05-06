@@ -109,3 +109,28 @@ class DedupeStoreTest(unittest.TestCase):
                 )
             finally:
                 store.close()
+
+    def test_menu_messages_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = DedupeStore(Path(temp_dir) / "shopper.sqlite3")
+            try:
+                store.save_menu_message(
+                    menu_key="elettronica:cuffie",
+                    message_id=100,
+                    extra_message_ids=(101,),
+                    title="elettronica / Cuffie",
+                )
+
+                menu = store.get_menu_message("elettronica:cuffie")
+                self.assertIsNotNone(menu)
+                assert menu is not None
+                self.assertEqual(menu.message_id, 100)
+                self.assertEqual(menu.extra_message_ids, (101,))
+                self.assertEqual(menu.title, "elettronica / Cuffie")
+                self.assertEqual(len(store.list_menu_messages()), 1)
+
+                store.delete_menu_message("elettronica:cuffie")
+
+                self.assertIsNone(store.get_menu_message("elettronica:cuffie"))
+            finally:
+                store.close()

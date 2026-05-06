@@ -17,13 +17,20 @@ from shopper_merge_bot.runtime import (
     edit_offer_media_as_gif,
     edit_offer_message,
     fingerprint_for_offer_url,
+    menu_group_summaries,
     passes_filters,
     preferred_source_id,
     product_similarity,
+    render_offer_menu_detail_text,
+    render_offer_menu_text,
+    render_menu_index_text,
     purge_inactive_link_offers,
     purge_inactive_published_messages,
+    set_publish_mode,
     resolve_offer_urls,
     stable_offer_body,
+    offer_menu_key,
+    parse_menu_callback_data,
 )
 
 
@@ -102,6 +109,71 @@ class RuntimeFormattingTest(unittest.TestCase):
 
             with Image.open(output) as image:
                 self.assertEqual(sum(1 for _ in ImageSequence.Iterator(image)), 2)
+
+    def test_offer_menu_groups_and_marks_recent_offers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = DedupeStore(Path(temp_dir) / "shopper.sqlite3")
+            try:
+                store.set_filter_categories(("elettronica", "software"))
+                fingerprint = fingerprint_for_offer_url("https://amazon.it/dp/B0HEADSET1")
+                store.save_offer(
+                    fingerprint=fingerprint,
+                    destination_chat_id="dest",
+                    primary_message_id=0,
+                    extra_message_ids=(),
+                    text=stable_offer_body(
+                        product="Bose QuietComfort Cuffie Wireless",
+                        original_price=Decimal("299.99"),
+                        current_price=Decimal("219.00"),
+                        offer_url="https://amazon.it/dp/B0HEADSET1",
+                    ),
+                    category="elettronica",
+                    price=Decimal("219.00"),
+                )
+                store.add_offer_source(
+                    fingerprint=fingerprint,
+                    source_chat_id="source",
+                    source_message_id=1,
+                    source_title="Canale",
+                    source_link="",
+                )
+                offer = store.get_offer(fingerprint)
+                assert offer is not None
+
+                self.assertEqual(offer_menu_key(offer), "elettronica:cuffie")
+                text = render_offer_menu_text(store, offer_menu_key(offer), [offer], 3500)
+
+                self.assertIn("elettronica / Cuffie", text)
+                self.assertIn("NUOVE 24h: 1", text)
+                self.assertIn("[NUOVA] 1. Bose QuietComfort Cuffie Wireless", text)
+                self.assertIn("https://amazon.it/dp/B0HEADSET1", text)
+                index = render_menu_index_text(store)
+                self.assertIn("Shopper Easly - Menu offerte", index)
+                self.assertIn("Offerte attive: 1", index)
+                self.assertIn("NUOVE 24h: 1", index)
+                summaries = menu_group_summaries(store)
+                self.assertIn(("software:all", "software / Software", 0, 0), summaries)
+                empty_detail = render_offer_menu_detail_text(store, "software:all", [], 0, 3500)
+                self.assertIn("Shopper Easly - software / Software", empty_detail)
+                self.assertIn("Offerte attive: 0 | NUOVE 24h: 0", empty_detail)
+                self.assertIn("Nessuna offerta attiva in questa tipologia.", empty_detail)
+            finally:
+                store.close()
+
+    def test_publish_mode_normalizes_menu_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = DedupeStore(Path(temp_dir) / "shopper.sqlite3")
+            try:
+                self.assertEqual(set_publish_mode(store, "menu"), "menu-only")
+            finally:
+                store.close()
+
+    def test_menu_callback_data_is_parsed(self) -> None:
+        self.assertEqual(
+            parse_menu_callback_data(b"menu:open:elettronica:cuffie:2"),
+            ("open", "elettronica:cuffie", 2),
+        )
+        self.assertEqual(parse_menu_callback_data(b"menu:close"), ("close", "", 0))
 
 
 class RuntimeFilterTest(unittest.TestCase):
