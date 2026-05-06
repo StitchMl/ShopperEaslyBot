@@ -47,6 +47,8 @@ PRIVATE_DELETE_CACHE_SECONDS = 180.0
 PRODUCT_GIF_FRAME_DURATION_MS = 1200
 PRODUCT_GIF_MAX_FRAMES = 12
 PRODUCT_GIF_MAX_SIDE = 900
+PRODUCT_GIF_FETCH_TIMEOUT_SECONDS = 30
+PRODUCT_GIF_UPLOAD_TIMEOUT_SECONDS = 60
 PRIVATE_DIALOG_CACHES: dict[tuple[int, str], "PrivateDialogCache"] = {}
 
 
@@ -771,7 +773,14 @@ def create_product_gif(image_paths: Iterable[Path], output_path: Path) -> bool:
 async def download_message_media(message: Message, directory: Path) -> Path | None:
     if not getattr(message, "media", None):
         return None
-    downloaded = await message.download_media(file=str(directory))
+    try:
+        downloaded = await asyncio.wait_for(
+            message.download_media(file=str(directory)),
+            timeout=PRODUCT_GIF_FETCH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        LOGGER.debug("Timed out downloading media for product GIF")
+        return None
     if not downloaded:
         return None
     path = Path(downloaded)
@@ -785,7 +794,10 @@ async def get_destination_message_with_media(
 ) -> Message | None:
     for sender in senders:
         try:
-            message = await sender.get_messages(destination, ids=message_id)
+            message = await asyncio.wait_for(
+                sender.get_messages(destination, ids=message_id),
+                timeout=PRODUCT_GIF_FETCH_TIMEOUT_SECONDS,
+            )
             if isinstance(message, list):
                 message = message[0] if message else None
             if message is not None and getattr(message, "media", None):
@@ -829,7 +841,10 @@ async def get_source_message(
 ) -> Message | None:
     for entity in source_entity_candidates(source.source_chat_id):
         try:
-            message = await reader.get_messages(entity, ids=source.source_message_id)
+            message = await asyncio.wait_for(
+                reader.get_messages(entity, ids=source.source_message_id),
+                timeout=PRODUCT_GIF_FETCH_TIMEOUT_SECONDS,
+            )
             if isinstance(message, list):
                 message = message[0] if message else None
             if message is not None:
@@ -858,20 +873,26 @@ async def edit_or_replace_offer_with_gif(
     for sender in senders_tuple:
         try:
             if target_has_media:
-                await sender.edit_message(
-                    destination,
-                    offer.primary_message_id,
-                    caption,
-                    file=gif_path,
-                    parse_mode=None,
+                await asyncio.wait_for(
+                    sender.edit_message(
+                        destination,
+                        offer.primary_message_id,
+                        caption,
+                        file=gif_path,
+                        parse_mode=None,
+                    ),
+                    timeout=PRODUCT_GIF_UPLOAD_TIMEOUT_SECONDS,
                 )
                 return True
 
-            result = await sender.send_file(
-                destination,
-                file=gif_path,
-                caption=caption,
-                parse_mode=None,
+            result = await asyncio.wait_for(
+                sender.send_file(
+                    destination,
+                    file=gif_path,
+                    caption=caption,
+                    parse_mode=None,
+                ),
+                timeout=PRODUCT_GIF_UPLOAD_TIMEOUT_SECONDS,
             )
             message_ids = _message_ids_from_result(result)
             if not message_ids:
@@ -1351,6 +1372,46 @@ async def merge_duplicate_active_offers(
                 failed += 1
 
     return renamed, merged, failed
+
+
+async def refresh_active_offer_gifs(
+    *,
+    senders: Iterable[TelegramClient],
+    source_reader: TelegramClient,
+    destination: object | None,
+    store: DedupeStore,
+    max_chars: int,
+    limit: int,
+) -> tuple[int, int, int, int]:
+    if destination is None:
+        return 0, 0, 0, len(store.list_active_offers())
+
+    scanned = 0
+    updated = 0
+    skipped = 0
+    failed = 0
+    for offer in store.list_active_offers():
+        if limit > 0 and scanned >= limit:
+            break
+        if len(store.offer_source_messages(offer.fingerprint)) < 2:
+            continue
+        scanned += 1
+        try:
+            if await refresh_offer_media_gif(
+                senders=senders,
+                source_reader=source_reader,
+                destination=destination,
+                store=store,
+                offer=offer,
+                max_chars=max_chars,
+            ):
+                updated += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            LOGGER.warning("Could not refresh offer GIF %s: %s", offer.fingerprint, exc)
+            failed += 1
+    return scanned, updated, skipped, failed
 
 
 async def purge_filtered_offers(
@@ -2380,9 +2441,10 @@ async def handle_message(
                 if not settings.dry_run:
                     media_updated = False
                     if settings.copy_media and message.media:
+                        source_reader = await first_user_client(cleanup_senders) or sender
                         media_updated = await refresh_offer_media_gif(
                             senders=cleanup_senders,
-                            source_reader=source_client,
+                            source_reader=source_reader,
                             destination=destination,
                             store=store,
                             offer=existing,
@@ -2553,6 +2615,7 @@ def control_help(user_id: int | None) -> str:
         "/purge_unmerged [numero] - elimina duplicati vecchi non registrati nel DB",
         "/purge_history [numero] [keep=N] - ripulisce la chat privata da offerte vecchie/duplicate/fuori filtro",
         "/recategorize [numero|all] - ricalcola categorie usando il sito dell'offerta",
+        "/refresh_gifs [numero|all] - crea GIF per offerte gia' unite con immagini diverse",
         "/reconcile - sincronizza filtri, merge e formato dei messaggi gia' pubblicati",
         "/diagnose_destination - prova invio, modifica e cancellazione nella destinazione",
         "/sources - mostra le sorgenti attive",
@@ -3142,6 +3205,48 @@ async def register_control_bot(
                     f"Offerte analizzate: {scanned}",
                     f"Messaggi aggiornati: {updated}",
                     f"Offerte rimosse dai filtri: {deleted}",
+                    f"Operazioni fallite: {failed}",
+                ]
+            ),
+            parse_mode=None,
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/refresh_gifs(?:@\w+)?(?:\s|$)"))
+    async def on_refresh_gifs(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+        if state.destination is None:
+            await event.respond("Destinazione non configurata.", parse_mode=None)
+            return
+
+        arg = command_arg(event.raw_text or "").lower()
+        limit = 200
+        if arg in {"all", "tutte", "tutti"}:
+            limit = 0
+        elif arg.isdigit():
+            limit = min(max(int(arg), 1), 5000)
+
+        await event.respond(
+            "Rigenero le GIF prodotto per "
+            + ("tutte le offerte unite..." if limit <= 0 else f"fino a {limit} offerte unite..."),
+            parse_mode=None,
+        )
+        source_reader = await first_user_client(cleanup_senders) or source_client
+        scanned, updated, skipped, failed = await refresh_active_offer_gifs(
+            senders=cleanup_senders,
+            source_reader=source_reader,
+            destination=state.destination,
+            store=store,
+            max_chars=settings.max_text_chars,
+            limit=limit,
+        )
+        await event.respond(
+            "\n".join(
+                [
+                    "Rigenerazione GIF completata.",
+                    f"Offerte unite controllate: {scanned}",
+                    f"GIF aggiornate: {updated}",
+                    f"Senza abbastanza immagini diverse: {skipped}",
                     f"Operazioni fallite: {failed}",
                 ]
             ),

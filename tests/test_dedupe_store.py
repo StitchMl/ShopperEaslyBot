@@ -102,5 +102,10 @@ class DedupeStoreTest(unittest.TestCase):
                     "deleted:merged-duplicate",
                 )
                 self.assertEqual(len(store.offer_sources("canonical")), 2)
+                source_messages = store.offer_source_messages("canonical")
+                self.assertEqual(
+                    [(source.source_chat_id, source.source_message_id) for source in source_messages],
+                    [("source-a", 1), ("source-b", 2)],
+                )
             finally:
                 store.close()
