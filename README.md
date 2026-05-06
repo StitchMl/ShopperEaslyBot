@@ -63,6 +63,8 @@ DESTINATION_CHAT=@mio_canale_offerte
 TELEGRAM_BOT_TOKEN=
 ADMIN_USER_IDS=
 DATABASE_PATH=/data/shopperbot.sqlite3
+EXPIRED_OFFER_CHECK_LIMIT=200
+EXPIRED_OFFER_CHECK_INTERVAL_SECONDS=1800
 ```
 
 Se `TELEGRAM_BOT_TOKEN` è vuoto, i messaggi vengono inviati dal tuo account.
@@ -131,6 +133,19 @@ Se vuoi essere piu' permissivo nello scoring:
 ```
 
 `/scan_bots` resta disponibile come alias, ma ora scansiona tutte le sorgenti.
+
+Per ripulire offerte gia' pubblicate ma terminate sul sito:
+
+```text
+/purge_expired 500
+```
+
+`/reconcile` include lo stesso controllo sui link. Inoltre il worker lo ripete
+ogni `EXPIRED_OFFER_CHECK_INTERVAL_SECONDS` secondi, 1800 per default; imposta
+`EXPIRED_OFFER_CHECK_LIMIT` per decidere quante offerte attive controllare a
+ogni giro. `/purge_expired` controlla sia le offerte salvate nel database sia
+i messaggi gia' presenti nella destinazione, cosi' puo' ripulire anche post
+pubblicati prima di questa versione o non piu' tracciati.
 
 ## Avvio locale
 

@@ -28,6 +28,15 @@ class OfferRecord:
     status: str
 
 
+@dataclass(frozen=True)
+class OfferSource:
+    source_chat_id: str
+    source_message_id: int
+    source_title: str
+    source_link: str
+    added_at: int
+
+
 class DedupeStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -102,6 +111,14 @@ class DedupeStore:
             ON offer_sources(source_chat_id, source_message_id);
             """
         )
+        self._ensure_column("offers", "link_checked_at", "INTEGER")
+        self._ensure_column("offers", "link_status", "TEXT NOT NULL DEFAULT 'unknown'")
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if any(str(row[1]) == column for row in rows):
+            return
+        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def get_config(self, key: str) -> str | None:
         row = self._conn.execute(
@@ -263,6 +280,58 @@ class DedupeStore:
     def list_active_offers(self) -> list[OfferRecord]:
         return self.list_offers("active")
 
+    def list_active_offers_for_link_check(self, limit: int) -> list[OfferRecord]:
+        limit_clause = "LIMIT ?" if limit > 0 else ""
+        params = (int(limit),) if limit > 0 else ()
+        rows = self._conn.execute(
+            f"""
+            SELECT
+                fingerprint,
+                destination_chat_id,
+                primary_message_id,
+                extra_message_ids,
+                text,
+                category,
+                price,
+                source_count,
+                status
+            FROM offers
+            WHERE status = 'active'
+            ORDER BY COALESCE(link_checked_at, 0), updated_at DESC
+            {limit_clause}
+            """,
+            params,
+        ).fetchall()
+        offers = []
+        for row in rows:
+            extra_ids = tuple(
+                int(item) for item in str(row[3]).split(",") if item.strip().isdigit()
+            )
+            offers.append(
+                OfferRecord(
+                    fingerprint=str(row[0]),
+                    destination_chat_id=str(row[1]),
+                    primary_message_id=int(row[2]),
+                    extra_message_ids=extra_ids,
+                    text=str(row[4]),
+                    category=str(row[5]),
+                    price=Decimal(str(row[6])) if row[6] else None,
+                    source_count=int(row[7]),
+                    status=str(row[8]),
+                )
+            )
+        return offers
+
+    def mark_offer_link_check(self, fingerprint: str, status: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE offers
+            SET link_checked_at = ?, link_status = ?
+            WHERE fingerprint = ?
+            """,
+            (int(time.time()), status[:120], fingerprint),
+        )
+
     def save_offer(
         self,
         *,
@@ -299,6 +368,8 @@ class DedupeStore:
                 price = excluded.price,
                 source_count = 1,
                 status = 'active',
+                link_checked_at = NULL,
+                link_status = 'unknown',
                 updated_at = excluded.updated_at
             """,
             (
@@ -463,6 +534,27 @@ class DedupeStore:
             (fingerprint,),
         ).fetchall()
         return [(str(title), str(link)) for title, link in rows]
+
+    def offer_source_messages(self, fingerprint: str) -> list[OfferSource]:
+        rows = self._conn.execute(
+            """
+            SELECT source_chat_id, source_message_id, source_title, source_link, added_at
+            FROM offer_sources
+            WHERE fingerprint = ?
+            ORDER BY added_at
+            """,
+            (fingerprint,),
+        ).fetchall()
+        return [
+            OfferSource(
+                source_chat_id=str(row[0]),
+                source_message_id=int(row[1]),
+                source_title=str(row[2]),
+                source_link=str(row[3]),
+                added_at=int(row[4]),
+            )
+            for row in rows
+        ]
 
     def fingerprints_for_source_message(
         self,

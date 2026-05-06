@@ -49,6 +49,20 @@ MEDIA_URL_HOSTS = (
     "m.media-amazon.com",
 )
 
+GENERIC_PRODUCT_PATTERNS = (
+    r"^sconto\s+del\s+fino\s+a\s+esaurimento\s+scorte\b",
+    r"^sconto\s+del\b",
+    r"^a\s+soli\s+invece\s+di(?:\s+di\s+sconto)?$",
+    r"^invece\s+di(?:\s+di\s+sconto)?$",
+    r"^condividi\s+\S+$",
+    r"^segnalat[ao]\s+su\b",
+    r"^segnalat[ao]\s+sull\b",
+    r"^occasione\s+su\b",
+    r"^i\s+prezzi\s+possono\s+subire\s+variazioni\b",
+    r"^disclaimer$",
+    r"^ad\s+info$",
+)
+
 CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "accessori": (
         "accessori",
@@ -64,6 +78,10 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "borsa per tablet",
         "borsa tablet",
         "borsa pc",
+        "zaino per laptop",
+        "zaino laptop",
+        "zaino per notebook",
+        "zaino notebook",
         "custodia",
         "custodie",
         "cover",
@@ -142,7 +160,13 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "lenovo",
         "asus",
         "acer",
-        "hp",
+        "hewlett-packard",
+        "hp pavilion",
+        "hp elitebook",
+        "hp envy",
+        "hp omen",
+        "hp deskjet",
+        "hp laserjet",
         "bose",
         "sony",
         "jbl",
@@ -182,6 +206,17 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "divano",
         "sedia",
         "lampada",
+        "lampadine",
+        "lampadina",
+        "illuminazione",
+        "barbecue",
+        "barbecue a gas",
+        "grill",
+        "weber",
+        "ripiani laterali",
+        "terrazze",
+        "balconi",
+        "bruciatore",
         "giardino",
         "bosch",
         "contenitore",
@@ -264,6 +299,20 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "shampoo",
         "cosmetico",
         "makeup",
+        "make up",
+        "fondotinta",
+        "incarnato",
+        "acido ialuronico",
+        "trucco",
+        "correttore",
+        "mascara",
+        "rossetto",
+        "labbra",
+        "smalto",
+        "smalti",
+        "unghie",
+        "manicure",
+        "nail",
         "trimmer",
         "phon",
         "epilatore",
@@ -308,6 +357,12 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "gioco",
         "giochi",
         "giocattolo",
+        "videogioco",
+        "videogiochi",
+        "nintendo",
+        "super mario",
+        "mario bros",
+        "switch",
         "boardgame",
         "puzzle",
         "nerf",
@@ -397,6 +452,9 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "trolley",
         "bagaglio",
         "bagagli",
+        "samsonite",
+        "zaino con ruote",
+        "con ruote",
         "lucchetto tsa",
         "lucchetto",
         "tsa",
@@ -425,6 +483,13 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "avvitatore",
         "ricambio",
         "ricambi",
+        "paranco",
+        "puleggia",
+        "argano",
+        "sollevatore",
+        "sollevamento",
+        "motore monofase",
+        "ribimex",
     ),
     "ufficio": (
         "cancelleria",
@@ -443,7 +508,11 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "penne",
         "scrittura",
         "cartucce",
+        "cartuccia",
         "toner",
+        "inkjet",
+        "deskjet",
+        "officejet",
         "stampante",
     ),
     "alimentari": (
@@ -476,8 +545,37 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "caramelle",
         "barrette",
         "proteine",
-        "croccantini",
         "cibo",
+    ),
+    "animali": (
+        "animali",
+        "animali domestici",
+        "pet",
+        "gatto",
+        "gatti",
+        "cane",
+        "cani",
+        "leccornia",
+        "croccantini",
+        "lettiera",
+        "snack per gatti",
+        "snack per cani",
+        "filetto di tonno",
+        "inaba",
+    ),
+    "musica": (
+        "strumenti musicali",
+        "strumento musicale",
+        "bacchette",
+        "bacchette per batteria",
+        "drumsticks",
+        "vic firth",
+        "hickory",
+        "punta di legno",
+        "chitarra",
+        "pianoforte",
+        "spartito",
+        "accordatore",
     ),
     "software": (
         "software",
@@ -489,8 +587,8 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "antivirus",
         "abbonamento",
         "app mobile",
-        "applicazione",
-        "applicazioni",
+        "applicazione mobile",
+        "applicazioni mobile",
         "steam",
         "playstation plus",
         "xbox game pass",
@@ -586,6 +684,8 @@ SITE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "illuminazione",
         "arredamento",
         "elettrodomestici",
+        "barbecue",
+        "grill",
     ),
     "moda": (
         "abbigliamento",
@@ -601,6 +701,9 @@ SITE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "cura della persona",
         "profumi",
         "cosmetici",
+        "make up",
+        "makeup",
+        "fondotinta",
         "igiene",
     ),
     "sport": (
@@ -614,6 +717,7 @@ SITE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "giochi e giocattoli",
         "giocattoli",
         "videogiochi",
+        "nintendo",
         "hobby",
     ),
     "infanzia": (
@@ -655,6 +759,9 @@ SITE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "ferramenta",
         "utensili",
         "utensili elettrici",
+        "sollevamento",
+        "paranchi",
+        "paranco",
         "viti",
         "bulloni",
         "tasselli",
@@ -669,6 +776,11 @@ SITE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "evidenziatori",
         "inchiostro",
         "toner",
+        "cartucce inchiostro",
+        "cartucce",
+        "accessori per stampanti",
+        "stampanti e accessori",
+        "inkjet",
     ),
     "alimentari": (
         "alimentari",
@@ -676,6 +788,21 @@ SITE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "food",
         "bevande",
         "drogheria",
+    ),
+    "animali": (
+        "animali",
+        "animali domestici",
+        "prodotti per animali",
+        "cani",
+        "gatti",
+        "pet shop",
+    ),
+    "musica": (
+        "strumenti musicali",
+        "musica",
+        "batterie e percussioni",
+        "percussioni",
+        "chitarre",
     ),
     "software": (
         "software",
@@ -841,11 +968,12 @@ def product_category_should_override_site(
     if product_category == "libri" and product_score >= site_score:
         return True
     misleading_site_categories = {
-        "giochi": {"moda", "infanzia", "casa", "auto", "viaggi"},
+        "giochi": {"moda", "infanzia", "casa", "auto", "viaggi", "animali", "musica"},
         "elettronica": {
             "accessori",
             "giochi",
             "moda",
+            "bellezza",
             "infanzia",
             "casa",
             "auto",
@@ -853,6 +981,9 @@ def product_category_should_override_site(
             "fai-da-te",
             "ufficio",
             "libri",
+            "alimentari",
+            "animali",
+            "musica",
         },
     }
     return product_category in misleading_site_categories.get(site_category, set())
@@ -880,7 +1011,7 @@ def fallback_category(text: str, site_text: str = "") -> str:
     combined = f"{site_text} {text}".strip()
     if not combined:
         return "casa"
-    if re.search(r"\b(?:w|mah|usb|hdmi|hz|gb|tb|bluetooth|wifi|wi fi|led|4k|5g)\b", combined):
+    if re.search(r"\b(?:mah|usb|hdmi|hz|gb|tb|bluetooth|wifi|wi fi|4k|5g)\b", combined):
         return "elettronica"
     if re.search(r"\b(?:ml|litri|kg|gr|gusto|ingredienti|senza zucchero|proteine)\b", combined):
         return "alimentari"
@@ -932,7 +1063,47 @@ def strip_noise(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def extract_product(text: str) -> str | None:
+def is_generic_product_candidate(candidate: str) -> bool:
+    normalized = re.sub(r"\s+", " ", candidate.lower()).strip(" -:,.")
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in GENERIC_PRODUCT_PATTERNS)
+
+
+def clean_site_product_candidate(candidate: str) -> str:
+    cleaned = re.sub(r"https?://\S+", " ", candidate)
+    cleaned = re.sub(r"[^\w\s.,:/+-]", " ", cleaned, flags=re.UNICODE)
+    cleaned = re.sub(r"\s*:\s*amazon\.[a-z.]+.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:,.")
+    return cleaned
+
+
+def site_product_from_context(site_text: str) -> str | None:
+    skipped = {
+        "dp",
+        "gp",
+        "amazon",
+        "amazon.it",
+        "giochi",
+        "videogiochi",
+        "elettronica",
+        "casa",
+        "libri",
+    }
+    for raw_part in site_text.split("|"):
+        candidate = clean_site_product_candidate(raw_part)
+        lowered = candidate.lower()
+        if len(candidate) < 8:
+            continue
+        if lowered in skipped:
+            continue
+        if "›" in candidate:
+            continue
+        if is_generic_product_candidate(candidate):
+            continue
+        return candidate[:140].strip(" -:,.") or None
+    return None
+
+
+def extract_product(text: str, site_text: str = "") -> str | None:
     banned_fragments = (
         "iscriviti",
         "gratis",
@@ -954,12 +1125,17 @@ def extract_product(text: str) -> str | None:
             continue
         if any(fragment in lowered for fragment in banned_fragments):
             continue
+        if is_generic_product_candidate(candidate):
+            continue
         if len(candidate) > len(best_line):
             best_line = candidate
 
     if not best_line:
+        site_product = site_product_from_context(site_text)
+        if site_product:
+            return site_product
         candidate = strip_noise(text)
-        if len(candidate) < 8:
+        if len(candidate) < 8 or is_generic_product_candidate(candidate):
             return None
         best_line = candidate
 
@@ -972,7 +1148,7 @@ def analyze_offer(text: str, urls: tuple[str, ...] = (), site_text: str = "") ->
         category=classify_category(text, site_text),
         price=current_price,
         invalid=is_invalid_offer(text),
-        product=extract_product(text),
+        product=extract_product(text, site_text),
         original_price=original_price,
         offer_url=pick_offer_url(text, urls),
     )

@@ -4,6 +4,7 @@ from decimal import Decimal
 from shopper_merge_bot.offer_analysis import (
     analyze_offer,
     classify_category,
+    extract_product,
     extract_price,
     is_invalid_offer,
     known_filter_categories,
@@ -48,6 +49,13 @@ class OfferAnalysisTest(unittest.TestCase):
         )
         self.assertEqual(
             classify_category("Molotow ONE ALL Inchiostro di Ricarica per Pennarello Indelebile, Blu , ml"),
+            "ufficio",
+        )
+        self.assertEqual(
+            classify_category(
+                "HP 301 Nero, CH561EE, Cartuccia Originale da 170 Pagine",
+                site_text="Informatica › Stampanti e accessori › Inkjet cartucce inchiostro",
+            ),
             "ufficio",
         )
         self.assertEqual(classify_category("SONGMICS - Scarpiera a Livelli"), "casa")
@@ -117,6 +125,10 @@ class OfferAnalysisTest(unittest.TestCase):
             classify_category("OtterBox Statement Series Studio Cover per iPad Air M"),
             "accessori",
         )
+        self.assertEqual(
+            classify_category("Samsonite - Zaino per Laptop da con Ruote"),
+            "viaggi",
+        )
         self.assertEqual(classify_category("Canon Fotocamera Mirrorless"), "elettronica")
         self.assertEqual(classify_category("Samsung TV 55 pollici QLED"), "elettronica")
 
@@ -146,6 +158,47 @@ class OfferAnalysisTest(unittest.TestCase):
             classify_category("GORMITI - Elesfera del Clan dell Acqua Carter - Giocattolo per Bambini"),
             "giochi",
         )
+        self.assertEqual(
+            classify_category("LEGO Editions Scuderia Ferrari HP Lewis Hamilton Helmet - F Merchandise"),
+            "giochi",
+        )
+        self.assertEqual(
+            classify_category("smalto unghie effetto manicure con gel ad applicazione ed asciugatura rapida"),
+            "bellezza",
+        )
+        self.assertEqual(
+            classify_category(
+                "Vic Firth Bacchette per Batteria Serie American Classic A Hickory "
+                "Americano Punta di Legno"
+            ),
+            "musica",
+        )
+        self.assertEqual(
+            classify_category("Nintendo New Super Mario Bros. U Deluxe Standard Allemand, Anglais"),
+            "giochi",
+        )
+        self.assertEqual(
+            classify_category("INABA Tuna Fillet Grilled - Leccornia per gatti con filetto di tonno"),
+            "animali",
+        )
+        self.assertEqual(
+            classify_category(
+                "L Oreal Paris Fondotinta Liquido, Incarnato Uniforme e Illuminato, "
+                "Formula con Acido Ialuronico"
+            ),
+            "bellezza",
+        )
+        self.assertEqual(
+            classify_category("Ribimex Paranco Elettrico da Kg con Puleggia, Motore Monofase da W"),
+            "fai-da-te",
+        )
+        self.assertEqual(
+            classify_category(
+                "Weber Q N Barbecue a Gas con Ripiani Laterali Ideale per terrazze e balconi, "
+                "bruciatore ad Alte Prestazioni"
+            ),
+            "casa",
+        )
 
     def test_product_can_override_broad_site_category(self) -> None:
         self.assertEqual(
@@ -168,6 +221,20 @@ class OfferAnalysisTest(unittest.TestCase):
                 site_text="Elettronica > Accessori",
             ),
             "giochi",
+        )
+        self.assertEqual(
+            classify_category(
+                "L Oreal Paris Fondotinta Liquido, Incarnato Uniforme e Illuminato",
+                site_text="Elettronica > Accessori",
+            ),
+            "bellezza",
+        )
+        self.assertEqual(
+            classify_category(
+                "INABA Tuna Fillet Grilled - Leccornia per gatti con filetto di tonno",
+                site_text="Elettronica > Accessori",
+            ),
+            "animali",
         )
 
     def test_invalid_offer_detection(self) -> None:
@@ -203,6 +270,43 @@ class OfferAnalysisTest(unittest.TestCase):
         self.assertEqual(facts.original_price, Decimal("129.99"))
         self.assertEqual(facts.current_price, Decimal("79.99"))
         self.assertEqual(facts.offer_url, "https://amazon.it/dp/B0ABCDEF12")
+
+    def test_generic_promo_product_uses_site_title(self) -> None:
+        site_text = (
+            "dp | Persona 3 Reload | Xbox & Windows 10 - Codice download : "
+            "Amazon.it: Videogiochi | Videogiochi › Xbox One › Giochi"
+        )
+        facts = analyze_offer(
+            "Sconto del fino a esaurimento scorte\nDa 69,99 EUR a 23,99 EUR",
+            ("https://amazon.it/dp/B0CQLKMMX4",),
+            site_text=site_text,
+        )
+
+        self.assertTrue(facts.complete)
+        self.assertEqual(facts.product, "Persona 3 Reload")
+        self.assertEqual(facts.category, "giochi")
+
+    def test_generic_promo_product_without_site_title_is_incomplete(self) -> None:
+        facts = analyze_offer(
+            "Sconto del fino a esaurimento scorte\nDa 69,99 EUR a 23,99 EUR",
+            ("https://amazon.it/dp/B0CQLKMMX4",),
+        )
+
+        self.assertFalse(facts.complete)
+        self.assertIsNone(facts.product)
+
+    def test_extract_product_ignores_common_promo_labels(self) -> None:
+        self.assertIsNone(extract_product("A soli invece di di sconto"))
+        self.assertIsNone(extract_product("Sconto del Affrettati"))
+        self.assertIsNone(extract_product("OCCASIONE SU MEDIAWORLD"))
+        self.assertIsNone(extract_product("Segnalata sull Angolino delle Offerte Speciali"))
+        self.assertEqual(
+            extract_product(
+                "Condividi codiciscontoonline",
+                "dp | EA SPORTS FC 26 Standard Edition PC | Codice EA App | Videogiochi",
+            ),
+            "EA SPORTS FC 26 Standard Edition PC",
+        )
 
     def test_offer_url_ignores_media_urls(self) -> None:
         facts = analyze_offer(

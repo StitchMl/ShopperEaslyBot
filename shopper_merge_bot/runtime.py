@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -22,9 +23,10 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import Channel, Chat, Message, User
 
+from . import __version__
 from .chat_folder import import_chat_folder
 from .config import ConfigError, Settings, parse_chat_ref
-from .dedupe import DedupeStore, OfferRecord
+from .dedupe import DedupeStore, OfferRecord, OfferSource
 from .formatter import trim_text
 from .normalization import build_fingerprint, canonicalize_url, normalize_text, resolve_redirect_url
 from .offer_analysis import (
@@ -34,7 +36,7 @@ from .offer_analysis import (
     parse_price_limit,
     source_score,
 )
-from .site_context import combined_site_context
+from .site_context import OfferActivity, combined_site_context, offer_activity_for_url
 
 
 LOGGER = logging.getLogger("shopper_merge_bot")
@@ -42,6 +44,9 @@ CAPTION_LIMIT = 1024
 BOT_API_BASE = "https://api.telegram.org/bot"
 PRIVATE_DELETE_SCAN_LIMIT = 10000
 PRIVATE_DELETE_CACHE_SECONDS = 180.0
+PRODUCT_GIF_FRAME_DURATION_MS = 1200
+PRODUCT_GIF_MAX_FRAMES = 12
+PRODUCT_GIF_MAX_SIDE = 900
 PRIVATE_DIALOG_CACHES: dict[tuple[int, str], "PrivateDialogCache"] = {}
 
 
@@ -59,6 +64,7 @@ class RuntimeState:
 class PublishedOfferMessage:
     message_id: int
     fingerprint: str
+    urls: tuple[str, ...]
     product: str | None
     original_price: Decimal | None
     current_price: Decimal | None
@@ -584,6 +590,19 @@ async def category_context_for_offer_urls(urls: Iterable[str]) -> str:
     return await asyncio.to_thread(combined_site_context, url_tuple)
 
 
+async def offer_activity_for_offer_urls(
+    urls: Iterable[str],
+    expected_price: Decimal | None = None,
+) -> OfferActivity:
+    last_activity: OfferActivity | None = None
+    for url in tuple(url for url in urls if url)[:3]:
+        activity = await asyncio.to_thread(offer_activity_for_url, url, expected_price)
+        if activity.status in {"active", "inactive"}:
+            return activity
+        last_activity = activity
+    return last_activity or OfferActivity(url="", status="unknown", reason="no-url", fetched=False)
+
+
 def category_matches_filter(category: str, selected: str) -> bool:
     if category == selected:
         return True
@@ -665,6 +684,358 @@ async def send_once(
         parse_mode=None,
     )
     return _message_ids_from_result(result)
+
+
+def image_hash(image: object) -> str:
+    try:
+        from PIL import Image
+    except ModuleNotFoundError:
+        return ""
+
+    if not isinstance(image, Image.Image):
+        return ""
+    thumbnail = image.copy()
+    thumbnail.thumbnail((160, 160), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (160, 160), "white")
+    x = (canvas.width - thumbnail.width) // 2
+    y = (canvas.height - thumbnail.height) // 2
+    canvas.paste(thumbnail, (x, y))
+    return hashlib.sha256(canvas.tobytes()).hexdigest()
+
+
+def normalized_gif_frame(image: object) -> object:
+    from PIL import Image
+
+    if image.mode in {"RGBA", "LA", "P"}:
+        converted = image.convert("RGBA")
+        background = Image.new("RGBA", converted.size, "white")
+        alpha = converted.getchannel("A") if "A" in converted.getbands() else None
+        background.paste(converted, mask=alpha)
+        converted = background.convert("RGB")
+    else:
+        converted = image.convert("RGB")
+    converted.thumbnail((PRODUCT_GIF_MAX_SIDE, PRODUCT_GIF_MAX_SIDE), Image.Resampling.LANCZOS)
+    return converted.copy()
+
+
+def create_product_gif(image_paths: Iterable[Path], output_path: Path) -> bool:
+    try:
+        from PIL import Image, ImageSequence, UnidentifiedImageError
+    except ModuleNotFoundError:
+        LOGGER.warning("Pillow is not installed; product GIF creation is disabled")
+        return False
+
+    frames = []
+    seen_hashes: set[str] = set()
+    for image_path in image_paths:
+        if len(frames) >= PRODUCT_GIF_MAX_FRAMES:
+            break
+        try:
+            with Image.open(image_path) as image:
+                for raw_frame in ImageSequence.Iterator(image):
+                    frame = normalized_gif_frame(raw_frame)
+                    fingerprint = image_hash(frame)
+                    if fingerprint and fingerprint not in seen_hashes:
+                        seen_hashes.add(fingerprint)
+                        frames.append(frame)
+                    if len(frames) >= PRODUCT_GIF_MAX_FRAMES:
+                        break
+        except (OSError, UnidentifiedImageError) as exc:
+            LOGGER.debug("Skipping non-image media %s while creating product GIF: %s", image_path, exc)
+            continue
+
+    if len(frames) < 2:
+        return False
+
+    width = max(frame.width for frame in frames)
+    height = max(frame.height for frame in frames)
+    rendered = []
+    for frame in frames:
+        canvas = Image.new("RGB", (width, height), "white")
+        x = (width - frame.width) // 2
+        y = (height - frame.height) // 2
+        canvas.paste(frame, (x, y))
+        rendered.append(canvas)
+
+    rendered[0].save(
+        output_path,
+        save_all=True,
+        append_images=rendered[1:],
+        duration=PRODUCT_GIF_FRAME_DURATION_MS,
+        loop=0,
+        optimize=True,
+    )
+    return output_path.exists()
+
+
+async def download_message_media(message: Message, directory: Path) -> Path | None:
+    if not getattr(message, "media", None):
+        return None
+    downloaded = await message.download_media(file=str(directory))
+    if not downloaded:
+        return None
+    path = Path(downloaded)
+    return path if path.exists() else None
+
+
+async def get_destination_message_with_media(
+    senders: Iterable[TelegramClient],
+    destination: object,
+    message_id: int,
+) -> Message | None:
+    for sender in senders:
+        try:
+            message = await sender.get_messages(destination, ids=message_id)
+            if isinstance(message, list):
+                message = message[0] if message else None
+            if message is not None and getattr(message, "media", None):
+                return message
+        except Exception as exc:
+            LOGGER.debug(
+                "Could not fetch destination media message %s with %s: %s",
+                message_id,
+                sender.session.__class__.__name__,
+                exc,
+            )
+    return None
+
+
+def source_entity_candidates(source_chat_id: str) -> tuple[object, ...]:
+    candidates: list[object] = []
+
+    def add(value: object) -> None:
+        if value not in candidates:
+            candidates.append(value)
+
+    cleaned = source_chat_id.strip()
+    if cleaned:
+        add(cleaned)
+    try:
+        numeric = int(cleaned)
+    except ValueError:
+        return tuple(candidates)
+    add(numeric)
+    if cleaned.startswith("-100") and len(cleaned) > 4:
+        try:
+            add(int(cleaned[4:]))
+        except ValueError:
+            pass
+    return tuple(candidates)
+
+
+async def get_source_message(
+    reader: TelegramClient,
+    source: OfferSource,
+) -> Message | None:
+    for entity in source_entity_candidates(source.source_chat_id):
+        try:
+            message = await reader.get_messages(entity, ids=source.source_message_id)
+            if isinstance(message, list):
+                message = message[0] if message else None
+            if message is not None:
+                return message
+        except Exception as exc:
+            LOGGER.debug(
+                "Could not fetch source media %s/%s via %r: %s",
+                source.source_chat_id,
+                source.source_message_id,
+                entity,
+                exc,
+            )
+    return None
+
+
+async def edit_or_replace_offer_with_gif(
+    senders: Iterable[TelegramClient],
+    destination: object,
+    store: DedupeStore,
+    offer: OfferRecord,
+    gif_path: Path,
+    caption: str,
+    target_has_media: bool,
+) -> bool:
+    senders_tuple = tuple(senders)
+    for sender in senders_tuple:
+        try:
+            if target_has_media:
+                await sender.edit_message(
+                    destination,
+                    offer.primary_message_id,
+                    caption,
+                    file=gif_path,
+                    parse_mode=None,
+                )
+                return True
+
+            result = await sender.send_file(
+                destination,
+                file=gif_path,
+                caption=caption,
+                parse_mode=None,
+            )
+            message_ids = _message_ids_from_result(result)
+            if not message_ids:
+                continue
+            old_ids = [offer.primary_message_id, *offer.extra_message_ids]
+            store.update_offer_delivery(
+                offer.fingerprint,
+                message_ids[0],
+                tuple(message_ids[1:]),
+            )
+            await delete_messages_with_fallback(
+                senders_tuple,
+                destination,
+                old_ids,
+                offer=offer,
+            )
+            return True
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not publish offer %s GIF with %s: %s",
+                offer.fingerprint,
+                sender.session.__class__.__name__,
+                exc,
+            )
+    return False
+
+
+async def refresh_offer_media_gif(
+    *,
+    senders: Iterable[TelegramClient],
+    source_reader: TelegramClient,
+    destination: object,
+    store: DedupeStore,
+    offer: OfferRecord,
+    max_chars: int,
+    current_source_message: Message | None = None,
+) -> bool:
+    sources = store.offer_source_messages(offer.fingerprint)
+    if len(sources) < 2 and current_source_message is None:
+        return False
+
+    caption = trim_text(
+        build_offer_publish_text_from_body(
+            body=offer.text,
+            category=offer.category,
+            sources=store.offer_sources(offer.fingerprint),
+            max_chars=max_chars,
+        ),
+        CAPTION_LIMIT,
+    )
+    senders_tuple = tuple(senders)
+    with tempfile.TemporaryDirectory(prefix="shopperbot-gif-") as temp_dir:
+        temp_path = Path(temp_dir)
+        media_paths: list[Path] = []
+        seen_source_messages: set[tuple[str, int]] = set()
+
+        target_message = await get_destination_message_with_media(
+            senders_tuple,
+            destination,
+            offer.primary_message_id,
+        )
+        target_has_media = target_message is not None
+        if target_message is not None:
+            target_dir = temp_path / "target"
+            target_dir.mkdir()
+            target_media = await download_message_media(target_message, target_dir)
+            if target_media is not None:
+                media_paths.append(target_media)
+
+        if current_source_message is not None and getattr(current_source_message, "media", None):
+            current_source_ids = message_source_ids(current_source_message)
+            current_source_id = current_source_ids[0] if current_source_ids else ""
+            seen_source_messages.add((current_source_id, int(current_source_message.id)))
+            current_dir = temp_path / "current"
+            current_dir.mkdir()
+            current_media = await download_message_media(current_source_message, current_dir)
+            if current_media is not None:
+                media_paths.append(current_media)
+
+        for source in sources:
+            source_key = (source.source_chat_id, source.source_message_id)
+            if source_key in seen_source_messages:
+                continue
+            source_message = await get_source_message(source_reader, source)
+            if source_message is None or not getattr(source_message, "media", None):
+                continue
+            source_dir = temp_path / f"source-{len(media_paths)}"
+            source_dir.mkdir()
+            source_media = await download_message_media(source_message, source_dir)
+            if source_media is not None:
+                media_paths.append(source_media)
+
+        gif_path = temp_path / "product-images.gif"
+        if not create_product_gif(media_paths, gif_path):
+            return False
+
+        return await edit_or_replace_offer_with_gif(
+            senders_tuple,
+            destination,
+            store,
+            offer,
+            gif_path,
+            caption,
+            target_has_media,
+        )
+
+
+async def edit_offer_media_as_gif(
+    senders: Iterable[TelegramClient],
+    destination: object,
+    offer: OfferRecord,
+    source_message: Message,
+    text: str,
+) -> bool:
+    if not getattr(source_message, "media", None):
+        return False
+
+    senders_tuple = tuple(senders)
+    with tempfile.TemporaryDirectory(prefix="shopperbot-gif-") as temp_dir:
+        temp_path = Path(temp_dir)
+        source_dir = temp_path / "source"
+        target_dir = temp_path / "target"
+        source_dir.mkdir()
+        target_dir.mkdir()
+
+        source_media = await download_message_media(source_message, source_dir)
+        if source_media is None:
+            return False
+
+        target_message = await get_destination_message_with_media(
+            senders_tuple,
+            destination,
+            offer.primary_message_id,
+        )
+        if target_message is None:
+            return False
+
+        target_media = await download_message_media(target_message, target_dir)
+        if target_media is None:
+            return False
+
+        gif_path = temp_path / "product-images.gif"
+        if not create_product_gif((target_media, source_media), gif_path):
+            return False
+
+        caption = trim_text(text, CAPTION_LIMIT)
+        for sender in senders_tuple:
+            try:
+                await sender.edit_message(
+                    destination,
+                    offer.primary_message_id,
+                    caption,
+                    file=gif_path,
+                    parse_mode=None,
+                )
+                return True
+            except Exception as exc:
+                LOGGER.warning(
+                    "Could not update offer %s media GIF with %s: %s",
+                    offer.fingerprint,
+                    sender.session.__class__.__name__,
+                    exc,
+                )
+    return False
 
 
 async def edit_offer_message(
@@ -1006,6 +1377,132 @@ async def purge_filtered_offers(
     return deleted, failed
 
 
+async def purge_inactive_link_offers(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object | None,
+    store: DedupeStore,
+    limit: int,
+) -> tuple[int, int, int, int, int]:
+    if destination is None:
+        return 0, 0, 0, 0, len(store.list_active_offers())
+
+    scanned = 0
+    deleted = 0
+    active = 0
+    unknown = 0
+    failed = 0
+    for offer in store.list_active_offers_for_link_check(limit):
+        scanned += 1
+        urls = await resolve_offer_urls(offer_record_urls(offer))
+        if not urls:
+            unknown += 1
+            store.mark_offer_link_check(offer.fingerprint, "unknown:no-url")
+            continue
+
+        try:
+            activity = await offer_activity_for_offer_urls(urls, offer.price)
+        except Exception as exc:
+            LOGGER.warning("Could not check offer link %s: %s", offer.fingerprint, exc)
+            failed += 1
+            store.mark_offer_link_check(offer.fingerprint, f"unknown:{exc.__class__.__name__}")
+            continue
+
+        if activity.status == "inactive":
+            store.mark_offer_link_check(offer.fingerprint, f"inactive:{activity.reason}")
+            if await delete_offer(
+                senders,
+                destination,
+                store,
+                offer.fingerprint,
+                f"expired-link:{activity.reason}",
+            ):
+                deleted += 1
+            else:
+                failed += 1
+            continue
+
+        if activity.status == "active":
+            active += 1
+        else:
+            unknown += 1
+        store.mark_offer_link_check(offer.fingerprint, f"{activity.status}:{activity.reason}")
+
+    return scanned, deleted, active, unknown, failed
+
+
+async def purge_inactive_published_messages(
+    *,
+    reader: TelegramClient,
+    senders: Iterable[TelegramClient],
+    destination: object | None,
+    store: DedupeStore,
+    limit: int,
+) -> tuple[int, int, int, int, int]:
+    if destination is None:
+        return 0, 0, 0, 0, 1
+    if is_private_user_destination(destination):
+        return await purge_inactive_private_published_messages(
+            senders=senders,
+            destination=destination,
+            store=store,
+            limit=limit,
+        )
+
+    scanned = 0
+    deleted = 0
+    active = 0
+    unknown = 0
+    failed = 0
+    delete_ids: list[int] = []
+    delete_reasons: dict[int, str] = {}
+    deleted_fingerprints: dict[int, str] = {}
+    iter_limit = None if limit <= 0 else limit
+    try:
+        async for message in reader.iter_messages(destination, limit=iter_limit):
+            published = await parse_published_offer_message(message)
+            if published is None:
+                continue
+            scanned += 1
+            try:
+                activity = await offer_activity_for_offer_urls(
+                    published.urls,
+                    published.current_price,
+                )
+            except Exception as exc:
+                LOGGER.warning("Could not check published offer %s: %s", published.message_id, exc)
+                failed += 1
+                continue
+
+            if activity.status == "inactive":
+                delete_ids.append(published.message_id)
+                delete_reasons[published.message_id] = activity.reason
+                deleted_fingerprints[published.message_id] = published.fingerprint
+            elif activity.status == "active":
+                active += 1
+            else:
+                unknown += 1
+    except Exception as exc:
+        LOGGER.warning("Could not scan destination history for expired offers: %s", exc)
+        return scanned, deleted, active, unknown, failed + 1
+
+    for start in range(0, len(delete_ids), 100):
+        chunk = delete_ids[start : start + 100]
+        if await delete_messages_with_fallback(senders, destination, chunk):
+            deleted += len(chunk)
+            for message_id in chunk:
+                offer = store.get_offer(deleted_fingerprints[message_id])
+                if offer is not None and offer.status == "active":
+                    store.mark_offer_status(
+                        offer.fingerprint,
+                        f"deleted:expired-destination:{delete_reasons[message_id]}",
+                    )
+        else:
+            failed += len(chunk)
+
+    return scanned, deleted, active, unknown, failed
+
+
 async def purge_legacy_offers(
     *,
     senders: Iterable[TelegramClient],
@@ -1181,6 +1678,7 @@ async def parse_published_offer_message(message: Message) -> PublishedOfferMessa
     return PublishedOfferMessage(
         message_id=int(message.id),
         fingerprint=fingerprint_for_offer_url(urls[0]),
+        urls=urls,
         product=product,
         original_price=parse_price_limit(original.lower()) if original else None,
         current_price=parse_price_limit(current.lower()) if current else None,
@@ -1216,6 +1714,7 @@ def parse_published_offer_message_fast(message_id: int, text: str) -> PublishedO
     return PublishedOfferMessage(
         message_id=message_id,
         fingerprint=fingerprint_for_offer_url(urls[0]),
+        urls=tuple(urls),
         product=product,
         original_price=parse_price_limit(original.lower()) if original else None,
         current_price=parse_price_limit(current.lower()) if current else None,
@@ -1227,6 +1726,7 @@ def offer_record_as_published(offer: OfferRecord) -> PublishedOfferMessage:
     return PublishedOfferMessage(
         message_id=offer.primary_message_id,
         fingerprint=offer.fingerprint,
+        urls=offer_record_urls(offer),
         product=offer_record_product(offer),
         original_price=offer_record_original_price(offer),
         current_price=offer.price,
@@ -1418,6 +1918,84 @@ async def delete_private_bot_dialog_messages(
             sorted(deleted_user_message_ids),
         )
     return deleted_any
+
+
+async def purge_inactive_private_published_messages(
+    *,
+    senders: Iterable[TelegramClient],
+    destination: object,
+    store: DedupeStore,
+    limit: int,
+) -> tuple[int, int, int, int, int]:
+    token = bot_api_token()
+    if token is None:
+        return 0, 0, 0, 0, 1
+
+    cache = await load_private_dialog_cache(
+        senders=senders,
+        bot_token=token,
+        destination=destination,
+    )
+    if cache is None:
+        return 0, 0, 0, 0, 1
+
+    scanned = 0
+    deleted = 0
+    active = 0
+    unknown = 0
+    failed = 0
+    scanned_messages = cache.messages if limit <= 0 else cache.messages[:limit]
+    delete_reasons: dict[int, str] = {}
+    for published in scanned_messages:
+        scanned += 1
+        try:
+            activity = await offer_activity_for_offer_urls(
+                published.urls,
+                published.current_price,
+            )
+        except Exception as exc:
+            LOGGER.warning("Could not check private published offer %s: %s", published.message_id, exc)
+            failed += 1
+            continue
+
+        if activity.status == "inactive":
+            delete_reasons[published.message_id] = activity.reason
+        elif activity.status == "active":
+            active += 1
+        else:
+            unknown += 1
+
+    deleted_ids: set[int] = set()
+    sorted_ids = sorted(delete_reasons)
+    for start in range(0, len(sorted_ids), 100):
+        chunk = sorted_ids[start : start + 100]
+        try:
+            await cache.user_client.delete_messages(cache.bot_entity, chunk, revoke=False)
+            deleted += len(chunk)
+            deleted_ids.update(chunk)
+        except Exception as exc:
+            LOGGER.warning("Could not purge private expired offers chunk %s: %s", chunk[:5], exc)
+            failed += len(chunk)
+
+    if deleted_ids:
+        active_by_fingerprint = {
+            offer.fingerprint: offer
+            for offer in store.list_active_offers()
+        }
+        for message in cache.messages:
+            if message.message_id not in deleted_ids:
+                continue
+            tracked = active_by_fingerprint.get(message.fingerprint)
+            if tracked is not None:
+                store.mark_offer_status(
+                    tracked.fingerprint,
+                    f"deleted:expired-private:{delete_reasons[message.message_id]}",
+                )
+        cache.messages = [
+            message for message in cache.messages if message.message_id not in deleted_ids
+        ]
+
+    return scanned, deleted, active, unknown, failed
 
 
 async def purge_unmerged_private_bot_dialog_messages(
@@ -1800,7 +2378,19 @@ async def handle_message(
                 )
                 store.update_offer_text(target_fingerprint, existing.text, len(sources))
                 if not settings.dry_run:
-                    await edit_offer_message(cleanup_senders, destination, existing, merged)
+                    media_updated = False
+                    if settings.copy_media and message.media:
+                        media_updated = await refresh_offer_media_gif(
+                            senders=cleanup_senders,
+                            source_reader=source_client,
+                            destination=destination,
+                            store=store,
+                            offer=existing,
+                            max_chars=settings.max_text_chars,
+                            current_source_message=message,
+                        )
+                    if not media_updated:
+                        await edit_offer_message(cleanup_senders, destination, existing, merged)
                 LOGGER.info("Merged duplicate offer %s from %s/%s", target_fingerprint, source_id, message_id)
             return
 
@@ -1886,6 +2476,53 @@ async def run_backfill(
             )
 
 
+async def run_expired_offer_checks(
+    *,
+    reader: TelegramClient,
+    senders: Iterable[TelegramClient],
+    store: DedupeStore,
+    state: RuntimeState,
+    settings: Settings,
+) -> None:
+    if settings.expired_offer_check_interval_seconds <= 0:
+        return
+
+    await asyncio.sleep(min(60, settings.expired_offer_check_interval_seconds))
+    while True:
+        if state.destination is None:
+            await asyncio.sleep(settings.expired_offer_check_interval_seconds)
+            continue
+        try:
+            tracked_scanned, tracked_deleted, tracked_active, tracked_unknown, tracked_failed = await purge_inactive_link_offers(
+                senders=senders,
+                destination=state.destination,
+                store=store,
+                limit=settings.expired_offer_check_limit,
+            )
+            history_scanned, history_deleted, history_active, history_unknown, history_failed = await purge_inactive_published_messages(
+                reader=reader,
+                senders=senders,
+                destination=state.destination,
+                store=store,
+                limit=settings.expired_offer_check_limit,
+            )
+            LOGGER.info(
+                "Expired offer link check: tracked_scanned=%s history_scanned=%s "
+                "deleted=%s active=%s unknown=%s failed=%s",
+                tracked_scanned,
+                history_scanned,
+                tracked_deleted + history_deleted,
+                tracked_active + history_active,
+                tracked_unknown + history_unknown,
+                tracked_failed + history_failed,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Could not complete expired offer link check")
+        await asyncio.sleep(settings.expired_offer_check_interval_seconds)
+
+
 def command_arg(raw_text: str) -> str:
     parts = raw_text.split(maxsplit=1)
     return parts[1].strip() if len(parts) == 2 else ""
@@ -1912,6 +2549,7 @@ def control_help(user_id: int | None) -> str:
         "/purge_legacy - elimina offerte pubblicate col vecchio formato",
         "/purge_legacy hard - ritenta anche vecchie eliminazioni fallite",
         "/purge_deleted - ritenta le cancellazioni gia' segnate nel database",
+        "/purge_expired [numero|all] - controlla i link e elimina offerte terminate",
         "/purge_unmerged [numero] - elimina duplicati vecchi non registrati nel DB",
         "/purge_history [numero] [keep=N] - ripulisce la chat privata da offerte vecchie/duplicate/fuori filtro",
         "/recategorize [numero|all] - ricalcola categorie usando il sito dell'offerta",
@@ -2340,6 +2978,51 @@ async def register_control_bot(
             parse_mode=None,
         )
 
+    @bot.on(events.NewMessage(pattern=r"^/purge_expired(?:@\w+)?(?:\s|$)"))
+    async def on_purge_expired(event: events.NewMessage.Event) -> None:
+        if not await is_control_admin(event, settings, store):
+            return
+        if state.destination is None:
+            await event.respond("Destinazione non configurata.", parse_mode=None)
+            return
+
+        arg = command_arg(event.raw_text or "").lower()
+        limit = settings.expired_offer_check_limit
+        if arg in {"all", "tutte", "tutti"}:
+            limit = 0
+        elif arg.isdigit():
+            limit = min(max(int(arg), 1), 5000)
+
+        scope = "tutte le offerte attive e la cronologia della destinazione" if limit <= 0 else f"fino a {limit} offerte attive e messaggi della destinazione"
+        await event.respond(f"Controllo i link di {scope}...", parse_mode=None)
+        tracked_scanned, tracked_deleted, tracked_active, tracked_unknown, tracked_failed = await purge_inactive_link_offers(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+            limit=limit,
+        )
+        history_scanned, history_deleted, history_active, history_unknown, history_failed = await purge_inactive_published_messages(
+            reader=bot,
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+            limit=limit,
+        )
+        await event.respond(
+            "\n".join(
+                [
+                    "Controllo link completato.",
+                    f"Offerte DB controllate: {tracked_scanned}",
+                    f"Messaggi destinazione controllati: {history_scanned}",
+                    f"Messaggi eliminati per offerta terminata: {tracked_deleted + history_deleted}",
+                    f"Link ancora attivi: {tracked_active + history_active}",
+                    f"Stato non determinabile: {tracked_unknown + history_unknown}",
+                    f"Operazioni fallite: {tracked_failed + history_failed}",
+                ]
+            ),
+            parse_mode=None,
+        )
+
     @bot.on(events.NewMessage(pattern=r"^/(purge_unmerged|purge_duplicates)(?:@\w+)?(?:\s|$)"))
     async def on_purge_unmerged(event: events.NewMessage.Event) -> None:
         if not await is_control_admin(event, settings, store):
@@ -2479,6 +3162,12 @@ async def register_control_bot(
             destination=state.destination,
             store=store,
         )
+        expired_scanned, expired_deleted, expired_active, expired_unknown, expired_failed = await purge_inactive_link_offers(
+            senders=cleanup_senders,
+            destination=state.destination,
+            store=store,
+            limit=settings.expired_offer_check_limit,
+        )
         renamed, merged, merge_failed = await merge_duplicate_active_offers(
             senders=cleanup_senders,
             destination=state.destination,
@@ -2514,13 +3203,16 @@ async def register_control_bot(
                 [
                     "Riconciliazione completata.",
                     f"Fuori filtro eliminati: {filtered_deleted}",
+                    f"Link offerte controllati: {expired_scanned}",
+                    f"Offerte terminate eliminate: {expired_deleted}",
+                    f"Link non determinabili: {expired_unknown}",
                     f"Fingerprint canonici aggiornati: {renamed}",
                     f"Duplicati uniti: {merged}",
                     f"Duplicati non registrati eliminati: {unmerged_deleted}",
                     f"Legacy eliminati: {legacy_deleted}",
                     f"Cancellazioni gia' segnate verificate: {verified_deleted}",
                     f"Messaggi riformattati: {reformatted}",
-                    f"Operazioni fallite: {filtered_failed + merge_failed + unmerged_failed + legacy_failed + verified_failed + reformat_failed}",
+                    f"Operazioni fallite: {filtered_failed + expired_failed + merge_failed + unmerged_failed + legacy_failed + verified_failed + reformat_failed}",
                 ]
             ),
             parse_mode=None,
@@ -2626,10 +3318,13 @@ async def register_control_bot(
             "\n".join(
                 [
                     "Stato Shopper Easly",
+                    f"Versione: {__version__}",
                     f"Sorgenti: {len(state.source_ids)}",
                     f"Destinazione: {state.destination_ref or 'non impostata'}",
                     f"Monitor all chats: {settings.monitor_all_chats}",
                     f"Dry run: {settings.dry_run}",
+                    f"Pulizia offerte terminate: /purge_expired disponibile",
+                    f"Controllo periodico offerte terminate: {settings.expired_offer_check_interval_seconds}s",
                     "",
                     filters_text(store),
                 ]
@@ -2650,6 +3345,7 @@ async def run(settings: Settings | None = None) -> None:
         settings.telegram_api_hash,
     )
     sender_client: TelegramClient | None = None
+    expired_checks_task: asyncio.Task[None] | None = None
 
     try:
         await source_client.start()
@@ -2707,62 +3403,7 @@ async def run(settings: Settings | None = None) -> None:
 
         cleanup_senders = unique_clients(sender, source_client)
         if state.destination is not None:
-            filtered_deleted, filtered_failed = await purge_filtered_offers(
-                senders=cleanup_senders,
-                destination=state.destination,
-                store=store,
-            )
-            renamed, merged, merge_failed = await merge_duplicate_active_offers(
-                senders=cleanup_senders,
-                destination=state.destination,
-                store=store,
-                max_chars=settings.max_text_chars,
-            )
-            unmerged_deleted, unmerged_groups, unmerged_failed = await purge_unmerged_destination_messages(
-                reader=sender,
-                senders=cleanup_senders,
-                destination=state.destination,
-                store=store,
-                limit=500,
-            )
-            legacy_deleted, legacy_failed = await purge_legacy_offers(
-                senders=cleanup_senders,
-                destination=state.destination,
-                store=store,
-                include_marked_deleted=True,
-            )
-            verified_deleted, verified_failed = await verify_marked_deleted_offers(
-                senders=cleanup_senders,
-                destination=state.destination,
-                store=store,
-            )
-            reformatted, reformat_failed = await reformat_active_offers(
-                senders=cleanup_senders,
-                destination=state.destination,
-                store=store,
-                max_chars=settings.max_text_chars,
-            )
-            LOGGER.info(
-                "Startup reconcile: filtered_deleted=%s filtered_failed=%s "
-                "renamed=%s merged=%s merge_failed=%s unmerged_deleted=%s "
-                "unmerged_groups=%s unmerged_failed=%s legacy_deleted=%s "
-                "legacy_failed=%s verified_deleted=%s verified_failed=%s "
-                "reformatted=%s reformat_failed=%s",
-                filtered_deleted,
-                filtered_failed,
-                renamed,
-                merged,
-                merge_failed,
-                unmerged_deleted,
-                unmerged_groups,
-                unmerged_failed,
-                legacy_deleted,
-                legacy_failed,
-                verified_deleted,
-                verified_failed,
-                reformatted,
-                reformat_failed,
-            )
+            LOGGER.info("Startup maintenance skipped; use /reconcile or /purge_expired to run cleanup")
         limiter = RateLimiter(settings.min_post_interval_seconds)
         sources = await resolve_saved_sources(source_client, store)
         await run_backfill(
@@ -2857,9 +3498,24 @@ async def run(settings: Settings | None = None) -> None:
             except Exception:
                 LOGGER.exception("Could not process deleted message")
 
+        expired_checks_task = asyncio.create_task(
+            run_expired_offer_checks(
+                reader=sender,
+                senders=cleanup_senders,
+                store=store,
+                state=state,
+                settings=settings,
+            )
+        )
         LOGGER.info("Shopper Easly bot is online")
         await source_client.run_until_disconnected()
     finally:
+        if expired_checks_task is not None:
+            expired_checks_task.cancel()
+            try:
+                await expired_checks_task
+            except asyncio.CancelledError:
+                pass
         store.close()
         await source_client.disconnect()
         if sender_client is not None:

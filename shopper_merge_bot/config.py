@@ -98,6 +98,8 @@ class Settings:
     dedupe_ttl_days: int
     min_post_interval_seconds: float
     max_text_chars: int
+    expired_offer_check_limit: int
+    expired_offer_check_interval_seconds: int
     allow_patterns: tuple[str, ...]
     skip_patterns: tuple[str, ...]
     log_level: str
@@ -141,6 +143,8 @@ class Settings:
             dedupe_ttl_days=_int("DEDUPE_TTL_DAYS", 14),
             min_post_interval_seconds=_float("MIN_POST_INTERVAL_SECONDS", 1.0),
             max_text_chars=_int("MAX_TEXT_CHARS", 3500),
+            expired_offer_check_limit=_int("EXPIRED_OFFER_CHECK_LIMIT", 200),
+            expired_offer_check_interval_seconds=_int("EXPIRED_OFFER_CHECK_INTERVAL_SECONDS", 1800),
             allow_patterns=_list("ALLOW_PATTERNS"),
             skip_patterns=_list("SKIP_PATTERNS"),
             log_level=_optional("LOG_LEVEL", "INFO").upper(),
@@ -160,6 +164,8 @@ class Settings:
             "dedupe_ttl_days": self.dedupe_ttl_days,
             "min_post_interval_seconds": self.min_post_interval_seconds,
             "max_text_chars": self.max_text_chars,
+            "expired_offer_check_limit": self.expired_offer_check_limit,
+            "expired_offer_check_interval_seconds": self.expired_offer_check_interval_seconds,
             "allow_patterns": self.allow_patterns,
             "skip_patterns": self.skip_patterns,
             "log_level": self.log_level,
